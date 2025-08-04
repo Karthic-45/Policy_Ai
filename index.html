@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Insurance Policy AI Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        #chat-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        #chat-container::-webkit-scrollbar-track {
+            background: #2d3748;
+        }
+        #chat-container::-webkit-scrollbar-thumb {
+            background-color: #4a5568;
+            border-radius: 20px;
+            border: 3px solid #2d3748;
+        }
+        .source-chunk {
+            transition: all 0.3s ease-in-out;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white flex flex-col items-center justify-center min-h-screen p-4">
+
+    <div class="w-full max-w-3xl mx-auto bg-gray-800 rounded-2xl shadow-2xl flex flex-col h-[90vh]">
+        <!-- Header -->
+        <div class="p-6 border-b border-gray-700">
+            <h1 class="text-2xl font-bold text-center text-gray-100">Insurance Policy AI Assistant</h1>
+            <p class="text-center text-gray-400 mt-1">Ask questions about your insurance documents.</p>
+        </div>
+
+        <!-- Chat Container -->
+        <div id="chat-container" class="flex-1 p-6 overflow-y-auto">
+            <!-- Initial Message -->
+            <div class="flex justify-start mb-4">
+                <div class="bg-indigo-600 rounded-lg p-4 max-w-lg">
+                    <p class="text-white">Hello! I have read all your insurance policy documents. How can I help you today?</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Example Questions -->
+        <div class="p-4 border-t border-gray-700">
+             <p class="text-sm text-gray-400 mb-2 font-medium">Try an example:</p>
+             <div class="flex flex-wrap gap-2">
+                 <button onclick="askExample(this)" class="bg-gray-700 text-gray-200 text-sm px-3 py-1 rounded-full hover:bg-gray-600 transition-colors">What is the waiting period for maternity expenses?</button>
+                 <button onclick="askExample(this)" class="bg-gray-700 text-gray-200 text-sm px-3 py-1 rounded-full hover:bg-gray-600 transition-colors">Is dental treatment covered?</button>
+                 <button onclick="askExample(this)" class="bg-gray-700 text-gray-200 text-sm px-3 py-1 rounded-full hover:bg-gray-600 transition-colors">What is the air ambulance coverage?</button>
+             </div>
+        </div>
+
+        <!-- Input Form -->
+        <div class="p-6 border-t border-gray-700 bg-gray-800 rounded-b-2xl">
+            <form id="chat-form" class="flex items-center gap-4">
+                <input type="text" id="user-input" placeholder="Type your question here..." class="flex-1 bg-gray-700 border border-gray-600 rounded-lg py-3 px-4 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-shadow">
+                <button type="submit" class="bg-indigo-600 text-white font-semibold py-3 px-6 rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                    Send
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        const chatForm = document.getElementById('chat-form');
+        const userInput = document.getElementById('user-input');
+        const chatContainer = document.getElementById('chat-container');
+        const submitButton = chatForm.querySelector('button[type="submit"]');
+
+        chatForm.addEventListener('submit', handleFormSubmit);
+
+        function handleFormSubmit(event) {
+            event.preventDefault();
+            const question = userInput.value.trim();
+            if (!question) return;
+
+            // Display user's question
+            appendMessage(question, 'user');
+            userInput.value = '';
+            
+            // Show loading indicator and process the query
+            showLoadingIndicator();
+            processQuery(question);
+        }
+
+        function askExample(button) {
+            const question = button.textContent;
+            userInput.value = question;
+            handleFormSubmit(new Event('submit', { cancelable: true }));
+        }
+
+        function appendMessage(text, sender) {
+            const messageWrapper = document.createElement('div');
+            messageWrapper.className = `flex mb-4 ${sender === 'user' ? 'justify-end' : 'justify-start'}`;
+            
+            const messageBubble = document.createElement('div');
+            messageBubble.className = `rounded-lg p-4 max-w-lg ${sender === 'user' ? 'bg-gray-700 text-white' : 'bg-indigo-600 text-white'}`;
+            messageBubble.innerHTML = `<p>${text}</p>`; // Use innerHTML to render line breaks
+
+            messageWrapper.appendChild(messageBubble);
+            chatContainer.appendChild(messageWrapper);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        function showLoadingIndicator() {
+            const loadingWrapper = document.createElement('div');
+            loadingWrapper.id = 'loading-indicator';
+            loadingWrapper.className = 'flex justify-start mb-4';
+            
+            loadingWrapper.innerHTML = `
+                <div class="bg-indigo-600 rounded-lg p-4 max-w-lg flex items-center">
+                    <div class="w-2 h-2 bg-white rounded-full animate-pulse mr-1.5" style="animation-delay: 0s;"></div>
+                    <div class="w-2 h-2 bg-white rounded-full animate-pulse mr-1.5" style="animation-delay: 0.2s;"></div>
+                    <div class="w-2 h-2 bg-white rounded-full animate-pulse" style="animation-delay: 0.4s;"></div>
+                </div>
+            `;
+            
+            chatContainer.appendChild(loadingWrapper);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            submitButton.disabled = true;
+        }
+
+        function removeLoadingIndicator() {
+            const indicator = document.getElementById('loading-indicator');
+            if (indicator) {
+                indicator.remove();
+            }
+            submitButton.disabled = false;
+        }
+
+        async function processQuery(question) {
+            try {
+                const response = await fetch('http://127.0.0.1:8000/ask', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ question: question }),
+                });
+
+                removeLoadingIndicator();
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || 'An unknown error occurred.');
+                }
+
+                const data = await response.json();
+                const formattedAnswer = data.answer.replace(/\n/g, '<br>');
+                appendAiResponse(formattedAnswer, data.source_chunks);
+
+            } catch (error) {
+                console.error('Error processing query:', error);
+                removeLoadingIndicator();
+                appendMessage(`Sorry, I encountered an error: ${error.message}`, 'ai');
+            }
+        }
+
+        function appendAiResponse(answer, sources) {
+            const messageWrapper = document.createElement('div');
+            messageWrapper.className = 'flex justify-start mb-4';
+            
+            const messageBubble = document.createElement('div');
+            messageBubble.className = 'bg-indigo-600 rounded-lg p-4 max-w-lg';
+            
+            let sourcesHtml = '';
+            if (sources && sources.length > 0) {
+                const sourcesContent = sources.map((src, index) => `
+                    <div class="source-chunk bg-indigo-700 p-3 mt-2 rounded-md">
+                        <p class="text-xs text-indigo-200 leading-relaxed">${src.replace(/\n/g, '<br>')}</p>
+                    </div>
+                `).join('');
+
+                sourcesHtml = `
+                    <div class="mt-4">
+                        <button onclick="toggleSources(this)" class="text-indigo-200 text-sm font-semibold hover:text-white">
+                            Show Sources
+                        </button>
+                        <div class="sources-content hidden mt-2 space-y-2">
+                            ${sourcesContent}
+                        </div>
+                    </div>
+                `;
+            }
+
+            messageBubble.innerHTML = `<p>${answer}</p>${sourcesHtml}`;
+            messageWrapper.appendChild(messageBubble);
+            chatContainer.appendChild(messageWrapper);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function toggleSources(button) {
+            const content = button.nextElementSibling;
+            if (content.classList.contains('hidden')) {
+                content.classList.remove('hidden');
+                button.textContent = 'Hide Sources';
+            } else {
+                content.classList.add('hidden');
+                button.textContent = 'Show Sources';
+            }
+        }
+    </script>
+</body>
+</html>
