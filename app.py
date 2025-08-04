@@ -4,11 +4,12 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import PromptTemplate
 from dotenv import load_dotenv
 
 # --- 1. LOAD ENVIRONMENT VARIABLES ---
-load_dotenv()  # Load from .env file
+load_dotenv()
 
 # --- 2. FASTAPI APP SETUP ---
 app = FastAPI(
@@ -33,26 +34,30 @@ qa_chain = None
 try:
     print("🔍 Loading FAISS index and models...")
 
-    # Read keys from environment
     openai_api_key = os.getenv("OPENAI_API_KEY")
     embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
     chat_model_name = os.getenv("CHAT_MODEL", "gpt-4")
 
-    # Set OpenAI key for LangChain
     os.environ["OPENAI_API_KEY"] = openai_api_key
 
-    # Embeddings and vector store
     embeddings = OpenAIEmbeddings(model=embedding_model_name)
-    faiss_index_path = "faiss_insurance_index"  # Adjust if needed
+    faiss_index_path = "faiss_insurance_index"
     vector_store = FAISS.load_local(
         faiss_index_path,
         embeddings,
         allow_dangerous_deserialization=True
     )
 
-    # LLM and QA chain
     llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
-    qa_chain = load_qa_chain(llm, chain_type="stuff")
+
+    prompt = PromptTemplate.from_template("""
+    Use the following context to answer the question.
+    
+    {context}
+
+    Question: {input}
+    """)
+    qa_chain = create_stuff_documents_chain(llm, prompt)
 
     print("✅ Index and models loaded successfully.")
 
@@ -85,13 +90,13 @@ def ask_question(request: QuestionRequest):
             }
 
         response = qa_chain.invoke({
-            "input_documents": relevant_chunks,
-            "question": question
+            "context": relevant_chunks,
+            "input": question
         })
 
         return {
             "question": question,
-            "answer": response["output_text"],
+            "answer": response,
             "source_chunks": [doc.page_content for doc in relevant_chunks]
         }
 
