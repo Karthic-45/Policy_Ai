@@ -37,7 +37,7 @@ vector_store = None
 qa_chain = None
 
 try:
-    print("\U0001F50D Loading FAISS index and models...")
+    print("🔍 Loading FAISS index and models...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
     embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
     chat_model_name = os.getenv("CHAT_MODEL", "gpt-4")
@@ -54,11 +54,18 @@ try:
     llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
 
     prompt = PromptTemplate.from_template("""
-    Use the following context to answer the question.
+    You are an expert assistant in insurance policy analysis.
 
+    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
+    - Do not make assumptions.
+    - Quote directly from the policy when possible.
+    - If the answer is not explicitly mentioned, say "The policy document does not explicitly mention this."
+
+    Context:
     {context}
 
     Question: {input}
+    Answer:
     """)
 
     qa_chain = create_stuff_documents_chain(llm, prompt)
@@ -121,8 +128,13 @@ async def hackrx_run(
         # 2. Load and split
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=700,
+            chunk_overlap=150,
+            separators=["\n\n", "\n", ".", " "]
+        )
         chunks = splitter.split_documents(docs)
+        print(f"🔹 Total Chunks: {len(chunks)}")
 
         # 3. Create temp FAISS index
         temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
