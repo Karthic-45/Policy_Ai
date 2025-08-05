@@ -1,0 +1,23 @@
+# --- Core Backend ---
+fastapi
+uvicorn
+
+# --- Environment Variables ---
+python-dotenv
+
+# --- LangChain Core ---
+langchain
+langchain-core
+langchain-openai
+langchain-community
+
+# --- Embeddings and Vector DB ---
+openai
+faiss-cpu
+
+# --- PDF Loading and Splitting ---
+PyMuPDF
+pydantic
+
+# Optional: You might already have these pulled via langchain, but explicitly including is safer
+tiktoken
