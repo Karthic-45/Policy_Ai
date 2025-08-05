@@ -1,6 +1,6 @@
 # --- Core Backend ---
 fastapi
-uvicorn
+uvicorn[standard]
 
 # --- Environment Variables ---
 python-dotenv
@@ -15,9 +15,9 @@ langchain-community
 openai
 faiss-cpu
 
-# --- PDF Loading and Splitting ---
+# --- PDF Loading and Data Handling ---
 PyMuPDF
 pydantic
 
-# Optional: You might already have these pulled via langchain, but explicitly including is safer
+# --- Token Counting (for OpenAI models) ---
 tiktoken
