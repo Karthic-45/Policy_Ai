@@ -44,7 +44,7 @@ try:
     embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
     vector_store = FAISS.load_local("faiss_insurance_index", embeddings, allow_dangerous_deserialization=True)
 
-    llm = ChatOpenAI(model_name="gpt-4", temperature=0.1)
+    llm = ChatOpenAI(model_name="gpt-4-1106-preview", temperature=0.1)
 
     prompt = PromptTemplate.from_template("""
 You are an expert insurance policy assistant.
