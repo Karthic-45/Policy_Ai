@@ -1,11 +1,12 @@
 import os
 import tempfile
+import asyncio
 import requests
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -15,18 +16,17 @@ from langchain_core.prompts import PromptTemplate
 from langchain.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# --- Load environment variables ---
+# Load environment variables
 load_dotenv()
-openai_api_key = os.getenv("OPENAI_API_KEY")
-os.environ["OPENAI_API_KEY"] = openai_api_key
 
-# --- FastAPI App Setup ---
+# Initialize FastAPI
 app = FastAPI(
     title="HackRx Insurance Q&A API",
-    description="Improved API for answering insurance document questions using GPT-4 and RAG.",
-    version="2.0.0"
+    description="Answer insurance-related questions using RAG and GPT",
+    version="1.0.0"
 )
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,47 +35,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Load Persistent FAISS Vector Store (Optional) ---
+# Load models and FAISS index
 vector_store = None
 qa_chain = None
 
 try:
-    print("🔄 Loading static FAISS index and LLM...")
-    embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
-    vector_store = FAISS.load_local("faiss_insurance_index", embeddings, allow_dangerous_deserialization=True)
+    print("🔍 Initializing models and vector store...")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    os.environ["OPENAI_API_KEY"] = openai_api_key
 
-    llm = ChatOpenAI(model_name="gpt-4-1106-preview", temperature=0.1)
+    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
+    chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
+
+    embeddings = OpenAIEmbeddings(model=embedding_model_name)
+    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
 
     prompt = PromptTemplate.from_template("""
-You are an expert insurance policy assistant.
+    You are an expert assistant in insurance policy analysis.
+    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
+    - Do not make assumptions.
+    - Quote directly from the policy when possible.
 
-Use the provided policy context to answer the question truthfully and clearly:
-- Only use the given context.
-- Do not fabricate or assume information.
-- Quote the policy when possible.
-- If the answer is not clearly mentioned, say: "The policy document does not specify this clearly."
+    Context:
+    {context}
 
-Context:
-{context}
-
-Question: {input}
-Answer:
-""")
+    Question: {input}
+    Answer:
+    """)
 
     qa_chain = create_stuff_documents_chain(llm, prompt)
-    print("✅ Model and chain loaded.")
+    print("✅ Models loaded successfully.")
 except Exception as e:
-    print(f"❌ Model loading failed: {e}")
+    print(f"❌ Failed to load models or index: {e}")
 
-# --- Health Check ---
-@app.get("/")
-def root():
-    return {"status": "API is running"}
-
-# --- Test Ask Endpoint ---
+# Request models
 class QuestionRequest(BaseModel):
     question: str
 
+class HackRxRequest(BaseModel):
+    documents: str
+    questions: List[str]
+
+# Health check endpoint
+@app.get("/")
+def health():
+    return {"status": "API is running"}
+
+# Question answering endpoint for single question (optional/test)
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
     if not vector_store or not qa_chain:
@@ -85,21 +91,26 @@ def ask_question(request: QuestionRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    relevant_chunks = vector_store.similarity_search(question, k=6)
-    raw_answer = qa_chain.invoke({"context": relevant_chunks, "input": question})
-    cleaned_answer = raw_answer.strip()
+    relevant_chunks = vector_store.similarity_search(question, k=4)
+    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
 
     return {
         "question": question,
-        "answer": cleaned_answer,
+        "answer": response,
         "source_chunks": [doc.page_content for doc in relevant_chunks]
     }
 
-# --- HackRx Run Endpoint ---
-class HackRxRequest(BaseModel):
-    documents: str
-    questions: List[str]
+# Async task for each question
+async def ask_async(llm_chain, vector_store, question):
+    rel_chunks = vector_store.similarity_search(question, k=4)
+    raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
+    answer = raw.strip()
 
+    if not answer or "i don't know" in answer.lower():
+        return "The policy document does not specify this clearly."
+    return answer
+
+# Main /hackrx/run endpoint
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
@@ -111,6 +122,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         raise HTTPException(status_code=403, detail="Invalid token.")
 
     try:
+        # Download and load PDF
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             response = requests.get(data.documents)
             tmp.write(response.content)
@@ -119,28 +131,21 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
 
+        # Split into chunks
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=512,
-            chunk_overlap=128,
+            chunk_size=400,
+            chunk_overlap=100,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
         print(f"📄 Chunks created: {len(chunks)}")
 
+        # Build temporary FAISS index
         temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
 
-        answers = []
-        for q in data.questions:
-            q_clean = q.strip()
-            rel_chunks = temp_vector_store.similarity_search(q_clean, k=6)
-            raw = qa_chain.invoke({"context": rel_chunks, "input": q_clean})
-            answer = raw.strip()
-
-            if not answer or "I don't know" in answer.lower():
-                answer = "The policy document does not specify this clearly."
-
-            print(f"🔍 Q: {q_clean}\n💬 A: {answer}\n---")
-            answers.append(answer)
+        # Run async tasks
+        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
+        answers = await asyncio.gather(*tasks)
 
         return {
             "status": "success",
