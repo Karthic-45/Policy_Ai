@@ -119,24 +119,21 @@ async def hackrx_run(
         raise HTTPException(status_code=403, detail="Invalid token.")
 
     try:
-        # 1. Download PDF
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             response = requests.get(data.documents)
             tmp.write(response.content)
             tmp_path = tmp.name
 
-        # 2. Load and split
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=700,
-            chunk_overlap=150,
+            chunk_size=512,
+            chunk_overlap=128,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
         print(f"🔹 Total Chunks: {len(chunks)}")
 
-        # 3. Create temp FAISS index
         temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
 
         answers = []
