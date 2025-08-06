@@ -3,12 +3,10 @@ import tempfile
 import asyncio
 import requests
 from typing import List, Optional
-
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -16,17 +14,17 @@ from langchain_core.prompts import PromptTemplate
 from langchain.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# Load environment variables
+# Load .env variables
 load_dotenv()
 
-# Initialize FastAPI
+# Initialize FastAPI app
 app = FastAPI(
     title="HackRx Insurance Q&A API",
     description="Answer insurance-related questions using RAG and GPT",
     version="1.0.0"
 )
 
-# CORS middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,12 +33,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load models and FAISS index
+# Load models
 vector_store = None
 qa_chain = None
-
 try:
-    print("🔍 Initializing models and vector store...")
+    print("🔍 Initializing models...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
     os.environ["OPENAI_API_KEY"] = openai_api_key
 
@@ -64,11 +61,11 @@ try:
     """)
 
     qa_chain = create_stuff_documents_chain(llm, prompt)
-    print("✅ Models loaded successfully.")
+    print("✅ Models initialized.")
 except Exception as e:
-    print(f"❌ Failed to load models or index: {e}")
+    print(f"❌ Error initializing models: {e}")
 
-# Request models
+# Pydantic models
 class QuestionRequest(BaseModel):
     question: str
 
@@ -76,12 +73,12 @@ class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# Health check endpoint
+# Health check
 @app.get("/")
 def health():
     return {"status": "API is running"}
 
-# Question answering endpoint for single question (optional/test)
+# Local single-question test endpoint
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
     if not vector_store or not qa_chain:
@@ -100,17 +97,16 @@ def ask_question(request: QuestionRequest):
         "source_chunks": [doc.page_content for doc in relevant_chunks]
     }
 
-# Async task for each question
+# Async task for answering
 async def ask_async(llm_chain, vector_store, question):
     rel_chunks = vector_store.similarity_search(question, k=4)
     raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
     answer = raw.strip()
-
     if not answer or "i don't know" in answer.lower():
         return "The policy document does not specify this clearly."
     return answer
 
-# Main /hackrx/run endpoint
+# HackRx Evaluation Endpoint
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
@@ -122,30 +118,40 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         raise HTTPException(status_code=403, detail="Invalid token.")
 
     try:
-        # Download and load PDF
+        import time
+        start_time = time.time()
+
+        # Download the PDF
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             response = requests.get(data.documents)
             tmp.write(response.content)
             tmp_path = tmp.name
 
+        # Load and clean document
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
+        docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
 
-        # Split into chunks
+        # Chunking
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=400,
+            chunk_size=600,
             chunk_overlap=100,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
         print(f"📄 Chunks created: {len(chunks)}")
 
-        # Build temporary FAISS index
+        # Limit chunk count
+        chunks = chunks[:300]
+
+        # Create temporary vector DB
         temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
 
-        # Run async tasks
+        # Answer all questions in parallel
         tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
+
+        print(f"⏱️ Total Time: {time.time() - start_time:.2f} sec")
 
         return {
             "status": "success",
