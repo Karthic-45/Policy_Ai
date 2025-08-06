@@ -37,7 +37,7 @@ vector_store = None
 qa_chain = None
 
 try:
-    print("\U0001F50D Loading FAISS index and models...")
+    print("🔍 Loading FAISS index and models...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
     embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
     chat_model_name = os.getenv("CHAT_MODEL", "gpt-4")
@@ -59,7 +59,6 @@ try:
     Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
     - Do not make assumptions.
     - Quote directly from the policy when possible.
-   
 
     Context:
     {context}
@@ -126,6 +125,7 @@ async def hackrx_run(
 
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
+
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=512,
             chunk_overlap=128,
@@ -143,7 +143,7 @@ async def hackrx_run(
             answers.append(answer)
 
         return {
-            "status":"success"
+            "status": "success",
             "answers": answers
         }
 
