@@ -37,7 +37,7 @@ vector_store = None
 qa_chain = None
 
 try:
-    print("🔍 Loading FAISS index and models...")
+    print("\U0001F50D Loading FAISS index and models...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
     embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
     chat_model_name = os.getenv("CHAT_MODEL", "gpt-4")
@@ -86,7 +86,7 @@ def ask_question(request: QuestionRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    relevant_chunks = vector_store.similarity_search(question, k=4)
+    relevant_chunks = vector_store.similarity_search(question, k=6)
     response = qa_chain.invoke({"context": relevant_chunks, "input": question})
 
     return {
@@ -129,8 +129,8 @@ async def hackrx_run(
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=700,
-            chunk_overlap=150,
+            chunk_size=512,
+            chunk_overlap=128,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
@@ -141,12 +141,12 @@ async def hackrx_run(
 
         answers = []
         for question in data.questions:
-            rel_chunks = temp_vector_store.similarity_search(question, k=4)
+            rel_chunks = temp_vector_store.similarity_search(question, k=6)
             answer = qa_chain.invoke({"context": rel_chunks, "input": question})
             answers.append(answer)
 
         return {
-            #"status": "success",
+           # "status": "success",
             "answers": answers
         }
 
