@@ -59,7 +59,7 @@ try:
     Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
     - Do not make assumptions.
     - Quote directly from the policy when possible.
-    - If the answer is not explicitly mentioned, say "The policy document does not explicitly mention this."
+   
 
     Context:
     {context}
