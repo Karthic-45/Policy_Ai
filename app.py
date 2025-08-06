@@ -129,8 +129,8 @@ async def hackrx_run(
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=512,
-            chunk_overlap=128,
+            chunk_size=700,
+            chunk_overlap=150,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
@@ -146,7 +146,6 @@ async def hackrx_run(
             answers.append(answer)
 
         return {
-           # "status": "success",
             "answers": answers
         }
 
