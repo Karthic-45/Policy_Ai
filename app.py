@@ -51,15 +51,15 @@ try:
         allow_dangerous_deserialization=True
     )
 
-    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.0)
+    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
 
     prompt = PromptTemplate.from_template("""
     You are an expert assistant in insurance policy analysis.
 
-    Use the following extracted context from an insurance document to answer the question accurately, concisely, and completely:
+    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
     - Do not make assumptions.
-    - Quote the document directly where applicable.
-    - If the answer is not mentioned, reply: "The policy document does not explicitly mention this."
+    - Quote directly from the policy when possible.
+    - If the answer is not explicitly mentioned, say "The policy document does not explicitly mention this."
 
     Context:
     {context}
@@ -86,7 +86,7 @@ def ask_question(request: QuestionRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    relevant_chunks = vector_store.similarity_search(question, k=6)
+    relevant_chunks = vector_store.similarity_search(question, k=4)
     response = qa_chain.invoke({"context": relevant_chunks, "input": question})
 
     return {
@@ -141,11 +141,12 @@ async def hackrx_run(
 
         answers = []
         for question in data.questions:
-            rel_chunks = temp_vector_store.similarity_search(question, k=6)
+            rel_chunks = temp_vector_store.similarity_search(question, k=4)
             answer = qa_chain.invoke({"context": rel_chunks, "input": question})
             answers.append(answer)
 
         return {
+            #"status": "success",
             "answers": answers
         }
 
