@@ -14,7 +14,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# Load .env variables
+# Load environment variables
 load_dotenv()
 
 # Initialize FastAPI app
@@ -24,7 +24,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load models
+# Global models
 vector_store = None
 qa_chain = None
 try:
@@ -65,7 +65,7 @@ try:
 except Exception as e:
     print(f"❌ Error initializing models: {e}")
 
-# Pydantic models
+# Request models
 class QuestionRequest(BaseModel):
     question: str
 
@@ -73,12 +73,12 @@ class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# Health check
+# Health check route
 @app.get("/")
 def health():
     return {"status": "API is running"}
 
-# Local single-question test endpoint
+# Local testing endpoint
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
     if not vector_store or not qa_chain:
@@ -97,7 +97,7 @@ def ask_question(request: QuestionRequest):
         "source_chunks": [doc.page_content for doc in relevant_chunks]
     }
 
-# Async task for answering
+# Async task handler
 async def ask_async(llm_chain, vector_store, question):
     rel_chunks = vector_store.similarity_search(question, k=4)
     raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
@@ -112,7 +112,6 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-
     token = authorization.split("Bearer ")[1]
     if token != expected_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
@@ -121,37 +120,41 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         import time
         start_time = time.time()
 
-        # Download the PDF
+        # Download and save PDF
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             response = requests.get(data.documents)
             tmp.write(response.content)
             tmp_path = tmp.name
 
-        # Load and clean document
+        # Load and filter document
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
-        docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
+        docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
 
-        # Chunking
+        # Optimized chunking
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=600,
-            chunk_overlap=100,
+            chunk_size=300,
+            chunk_overlap=30,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
-        print(f"📄 Chunks created: {len(chunks)}")
+        print(f"📄 Chunks created (before limit): {len(chunks)}")
 
-        # Limit chunk count
-        chunks = chunks[:300]
+        # Cap chunk count
+        max_chunks = 200
+        chunks = chunks[:max_chunks]
+        print(f"📄 Chunks used: {len(chunks)}")
 
-        # Create temporary vector DB
-        temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
+        # Temporary FAISS vector store
+        embeddings_model = OpenAIEmbeddings(model="text-embedding-ada-002")
+        temp_vector_store = FAISS.from_documents(chunks, embeddings_model)
 
-        # Answer all questions in parallel
+        # Async answering
         tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
-        print(f"⏱️ Total Time: {time.time() - start_time:.2f} sec")
+        total_time = time.time() - start_time
+        print(f"⏱️ Total Time: {total_time:.2f} sec")
 
         return {
             "status": "success",
