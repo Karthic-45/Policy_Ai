@@ -11,7 +11,7 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
-from langchain.document_loaders import PyMuPDFLoader
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # Load .env variables
@@ -24,7 +24,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load models
+# Load LLM and Embedding Models
 vector_store = None
 qa_chain = None
 try:
@@ -65,7 +65,7 @@ try:
 except Exception as e:
     print(f"❌ Error initializing models: {e}")
 
-# Pydantic models
+# Input Models
 class QuestionRequest(BaseModel):
     question: str
 
@@ -73,17 +73,17 @@ class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# Health check
+# Health Check Endpoint
 @app.get("/")
 def health():
     return {"status": "API is running"}
 
-# Local single-question test endpoint
+# Local Test Endpoint
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
     if not vector_store or not qa_chain:
         raise HTTPException(status_code=500, detail="Model not loaded.")
-
+    
     question = request.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
@@ -97,7 +97,7 @@ def ask_question(request: QuestionRequest):
         "source_chunks": [doc.page_content for doc in relevant_chunks]
     }
 
-# Async task for answering
+# Async processing
 async def ask_async(llm_chain, vector_store, question):
     rel_chunks = vector_store.similarity_search(question, k=4)
     raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
@@ -112,7 +112,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-
+    
     token = authorization.split("Bearer ")[1]
     if token != expected_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
@@ -132,6 +132,9 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         docs = loader.load()
         docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
 
+        if not docs:
+            raise HTTPException(status_code=400, detail="The PDF has no valid textual content.")
+
         # Chunking
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=600,
@@ -140,6 +143,9 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         )
         chunks = splitter.split_documents(docs)
         print(f"📄 Chunks created: {len(chunks)}")
+
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No meaningful chunks could be created from the document.")
 
         # Limit chunk count
         chunks = chunks[:300]
