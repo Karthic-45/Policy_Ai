@@ -30,14 +30,8 @@ Question: {input}
 Answer:
 """)
 
-# Chat Model & Chain
+# Chat Model
 llm = ChatOpenAI(model="gpt-4-1106-preview", temperature=0.2)
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    return_source_documents=False,
-    chain_type_kwargs={"prompt": prompt_template},
-)
 
 # Request Schema
 class HackRxRequest(BaseModel):
@@ -79,7 +73,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
-        print(f"\U0001F4C4 Total Chunks created: {len(chunks)}")
+        print(f"📄 Total Chunks created: {len(chunks)}")
 
         if not chunks:
             raise HTTPException(status_code=400, detail="No chunks created.")
@@ -98,12 +92,18 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             print(f"Processing batch {batch_num + 1} with {len(batch)} chunks")
             vector_store = FAISS.from_documents(batch, OpenAIEmbeddings(model="text-embedding-ada-002"))
 
+            # Create a fresh QA chain for each batch with retriever
+            retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 10})
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=retriever,
+                return_source_documents=False,
+                chain_type_kwargs={"prompt": prompt_template},
+            )
+
             async def retrieve_answer(q):
-                results = vector_store.similarity_search_with_score(q, k=10)
-                relevant_chunks = [doc for doc, score in results if score < 0.3]
-                if not relevant_chunks:
-                    relevant_chunks = [doc for doc, _ in results[:4]]
-                response = await qa_chain.ainvoke({"context": relevant_chunks, "input": q})
+                response = await qa_chain.ainvoke({"query": q})
                 answer = response.strip()
                 if not answer or "i don't know" in answer.lower():
                     return "The policy document does not specify this clearly."
@@ -116,7 +116,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         # Merge answers across batches (if needed, deduplicate or keep best)
         merged_answers = all_answers[0]  # assuming same answer repeated, just pick from first batch
 
-        print(f"⏱ Total Time: {time.time() - start_time:.2f} sec")
+        print(f"⏱️ Total Time: {time.time() - start_time:.2f} sec")
 
         return {
             "status": "success",
