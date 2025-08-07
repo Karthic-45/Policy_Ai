@@ -13,6 +13,8 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
 from langchain.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 # Load environment variables
 load_dotenv()
@@ -131,25 +133,37 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         docs = loader.load()
         docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
 
-        # Optimized chunking
+        # Chunk everything
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=300,
             chunk_overlap=30,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
-        print(f"📄 Chunks created (before limit): {len(chunks)}")
+        print(f"📄 Chunks created (before filtering): {len(chunks)}")
 
-        # Cap chunk count
-        max_chunks = 200
-        chunks = chunks[:max_chunks]
-        print(f"📄 Chunks used: {len(chunks)}")
-
-        # Temporary FAISS vector store
+        # Embed all chunk texts
         embeddings_model = OpenAIEmbeddings(model="text-embedding-ada-002")
-        temp_vector_store = FAISS.from_documents(chunks, embeddings_model)
+        chunk_texts = [doc.page_content for doc in chunks]
+        chunk_embeddings = embeddings_model.embed_documents(chunk_texts)
 
-        # Async answering
+        # Embed questions
+        question_embeddings = [embeddings_model.embed_query(q.strip()) for q in data.questions]
+
+        # Compute max similarity for each chunk
+        similarity_matrix = cosine_similarity(question_embeddings, chunk_embeddings)
+        scores = np.max(similarity_matrix, axis=0)
+
+        # Select top 200 chunks
+        top_n = 200
+        top_indices = np.argsort(scores)[-top_n:][::-1]
+        selected_chunks = [chunks[i] for i in top_indices]
+        print(f"📄 Chunks selected (after relevance filter): {len(selected_chunks)}")
+
+        # Create FAISS vector store from top chunks
+        temp_vector_store = FAISS.from_documents(selected_chunks, embeddings_model)
+
+        # Process questions in parallel
         tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
