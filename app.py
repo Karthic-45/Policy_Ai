@@ -116,7 +116,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         # Merge answers across batches (if needed, deduplicate or keep best)
         merged_answers = all_answers[0]  # assuming same answer repeated, just pick from first batch
 
-        print(f"⏱️ Total Time: {time.time() - start_time:.2f} sec")
+        print(f"⏱ Total Time: {time.time() - start_time:.2f} sec")
 
         return {
             "status": "success",
