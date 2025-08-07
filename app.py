@@ -131,9 +131,18 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         docs = loader.load()
         docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
 
+        # Determine chunk size based on page count
+        page_count = len(docs)
+        if page_count <= 5:
+            chunk_size = 600
+        elif page_count <= 10:
+            chunk_size = 800
+        else:
+            chunk_size = 1000
+
         # Optimized chunking
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
+            chunk_size=chunk_size,
             chunk_overlap=100,
             separators=["\n\n", "\n", ".", " "]
         )
