@@ -11,7 +11,7 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
-from langchain_community.document_loaders import PyMuPDFLoader
+from langchain.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # Load .env variables
@@ -52,7 +52,6 @@ try:
     Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
     - Do not make assumptions.
     - Quote directly from the policy when possible.
-    - If the answer is not in the context, say "Not mentioned in policy."
 
     Context:
     {context}
