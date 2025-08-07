@@ -22,5 +22,5 @@ pydantic
 # --- Token Counting (for OpenAI models) ---
 tiktoken
 
-# --- Added: For Cosine Similarity ---
+# --- Cosine Similarity ---
 scikit-learn
