@@ -88,7 +88,7 @@ def ask_question(request: QuestionRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    relevant_chunks = vector_store.similarity_search(question, k=4)
+    relevant_chunks = vector_store.similarity_search(question, k=12)
     response = qa_chain.invoke({"context": relevant_chunks, "input": question})
 
     return {
@@ -99,7 +99,7 @@ def ask_question(request: QuestionRequest):
 
 # Async task handler
 async def ask_async(llm_chain, vector_store, question):
-    rel_chunks = vector_store.similarity_search(question, k=4)
+    rel_chunks = vector_store.similarity_search(question, k=12)
     raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
     answer = raw.strip()
     if not answer or "i don't know" in answer.lower():
@@ -133,15 +133,15 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
         # Optimized chunking
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=300,
-            chunk_overlap=30,
+            chunk_size=800,
+            chunk_overlap=100,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
         print(f"📄 Chunks created (before limit): {len(chunks)}")
 
         # Cap chunk count
-        max_chunks = 200
+        max_chunks = 300
         chunks = chunks[:max_chunks]
         print(f"📄 Chunks used: {len(chunks)}")
 
