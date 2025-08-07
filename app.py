@@ -1,118 +1,55 @@
 import os
-import tempfile
 import asyncio
+import tempfile
 import requests
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from dotenv import load_dotenv
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import PromptTemplate
-from langchain_community.document_loaders import PyMuPDFLoader
+from typing import List, Optional
+from langchain.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain.chat_models import ChatOpenAI
 
-# Load .env variables
-load_dotenv()
+app = FastAPI()
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="HackRx Insurance Q&A API",
-    description="Answer insurance-related questions using RAG and GPT",
-    version="1.0.0"
+# Prompt Template
+prompt_template = PromptTemplate.from_template("""
+You are an insurance policy assistant. Use the provided policy context to answer the question accurately.
+
+- Be concise and precise
+- Quote directly if relevant
+- If the answer is not in the context, say: "The policy document does not specify this clearly."
+
+Context:
+{context}
+
+Question: {input}
+Answer:
+""")
+
+# Chat Model & Chain
+llm = ChatOpenAI(model="gpt-4-1106-preview", temperature=0.2)
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    chain_type="stuff",
+    return_source_documents=False,
+    chain_type_kwargs={"prompt": prompt_template},
 )
 
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Load LLM and Embedding Models
-vector_store = None
-qa_chain = None
-try:
-    print("🔍 Initializing models...")
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    os.environ["OPENAI_API_KEY"] = openai_api_key
-
-    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
-    chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
-
-    embeddings = OpenAIEmbeddings(model=embedding_model_name)
-    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
-
-    prompt = PromptTemplate.from_template("""
-    You are an expert assistant in insurance policy analysis.
-    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
-    - Do not make assumptions.
-    - Quote directly from the policy when possible.
-
-    Context:
-    {context}
-
-    Question: {input}
-    Answer:
-    """)
-
-    qa_chain = create_stuff_documents_chain(llm, prompt)
-    print("✅ Models initialized.")
-except Exception as e:
-    print(f"❌ Error initializing models: {e}")
-
-# Input Models
-class QuestionRequest(BaseModel):
-    question: str
-
+# Request Schema
 class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# Health Check Endpoint
-@app.get("/")
-def health():
-    return {"status": "API is running"}
-
-# Local Test Endpoint
-@app.post("/ask")
-def ask_question(request: QuestionRequest):
-    if not vector_store or not qa_chain:
-        raise HTTPException(status_code=500, detail="Model not loaded.")
-    
-    question = request.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    relevant_chunks = vector_store.similarity_search(question, k=4)
-    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
-
-    return {
-        "question": question,
-        "answer": response,
-        "source_chunks": [doc.page_content for doc in relevant_chunks]
-    }
-
-# Async processing
-async def ask_async(llm_chain, vector_store, question):
-    rel_chunks = vector_store.similarity_search(question, k=4)
-    raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
-    answer = raw.strip()
-    if not answer or "i don't know" in answer.lower():
-        return "The policy document does not specify this clearly."
-    return answer
-
-# HackRx Evaluation Endpoint
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-    
+
     token = authorization.split("Bearer ")[1]
     if token != expected_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
@@ -121,47 +58,70 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         import time
         start_time = time.time()
 
-        # Download the PDF
+        # Download the PDF and load
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             response = requests.get(data.documents)
             tmp.write(response.content)
             tmp_path = tmp.name
 
-        # Load and clean document
         loader = PyMuPDFLoader(tmp_path)
-        docs = loader.load()
-        docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
+        raw_docs = loader.load()
 
+        # Filter out short/noisy pages
+        docs = [doc for doc in raw_docs if len(doc.page_content.strip()) > 150]
         if not docs:
-            raise HTTPException(status_code=400, detail="The PDF has no valid textual content.")
+            raise HTTPException(status_code=400, detail="Document has no meaningful content.")
 
-        # Chunking
+        # Split docs into chunks
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=600,
             chunk_overlap=100,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
-        print(f"📄 Chunks created: {len(chunks)}")
+        print(f"\U0001F4C4 Total Chunks created: {len(chunks)}")
 
         if not chunks:
-            raise HTTPException(status_code=400, detail="No meaningful chunks could be created from the document.")
+            raise HTTPException(status_code=400, detail="No chunks created.")
 
-        # Limit chunk count
-        chunks = chunks[:300]
+        # Sort by content length and retain most meaningful chunks
+        sorted_chunks = sorted(chunks, key=lambda x: len(x.page_content), reverse=True)
 
-        # Create temporary vector DB
-        temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
+        # Divide into manageable batches (e.g., batches of 250)
+        batch_size = 250
+        chunk_batches = [sorted_chunks[i:i + batch_size] for i in range(0, len(sorted_chunks), batch_size)]
 
-        # Answer all questions in parallel
-        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
-        answers = await asyncio.gather(*tasks)
+        all_answers = []
+
+        # Process questions on each batch
+        for batch_num, batch in enumerate(chunk_batches):
+            print(f"Processing batch {batch_num + 1} with {len(batch)} chunks")
+            vector_store = FAISS.from_documents(batch, OpenAIEmbeddings(model="text-embedding-ada-002"))
+
+            async def retrieve_answer(q):
+                results = vector_store.similarity_search_with_score(q, k=10)
+                relevant_chunks = [doc for doc, score in results if score < 0.3]
+                if not relevant_chunks:
+                    relevant_chunks = [doc for doc, _ in results[:4]]
+                response = await qa_chain.ainvoke({"context": relevant_chunks, "input": q})
+                answer = response.strip()
+                if not answer or "i don't know" in answer.lower():
+                    return "The policy document does not specify this clearly."
+                return answer
+
+            tasks = [retrieve_answer(q.strip()) for q in data.questions]
+            batch_answers = await asyncio.gather(*tasks)
+            all_answers.append(batch_answers)
+
+        # Merge answers across batches (if needed, deduplicate or keep best)
+        merged_answers = all_answers[0]  # assuming same answer repeated, just pick from first batch
 
         print(f"⏱️ Total Time: {time.time() - start_time:.2f} sec")
 
         return {
             "status": "success",
-            "answers": answers
+            "answers": merged_answers,
+            "batches_processed": len(chunk_batches)
         }
 
     except Exception as e:
