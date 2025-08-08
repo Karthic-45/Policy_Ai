@@ -5,7 +5,7 @@ uvicorn[standard]
 # --- Environment Variables ---
 python-dotenv
 
-# --- LangChain Core ---
+# --- LangChain Core & OpenAI Integration ---
 langchain>=0.2.0
 langchain-core
 langchain-openai
@@ -22,5 +22,5 @@ pydantic
 # --- Token Counting (for OpenAI models) ---
 tiktoken
 
-# --- Cosine Similarity ---
-scikit-learn
+# --- Extra dependency for this setup ---
+requests
