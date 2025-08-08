@@ -1,174 +1,167 @@
 import os
-import tempfile
 import asyncio
+import tempfile
 import requests
-from typing import List, Optional
+import torch
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dotenv import load_dotenv
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import PromptTemplate
-from langchain.document_loaders import PyMuPDFLoader
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
+from transformers import pipeline, logging
 
-# Load environment variables
-load_dotenv()
+# Suppress verbose transformer warnings
+logging.set_verbosity_error()
 
-# Initialize FastAPI app
+# ===== CONFIG (Tuned for Hackathon Speed) =====
+TOP_K_FAISS = 8
+TOP_K_BM25 = 8
+FINAL_TOP_K = 10
+CONTEXT_LIMIT = 3000  # Chars
+
+# Model choices for speed vs. accuracy tradeoff
+EMBED_MODEL = "sentence-transformers/all-mpnet-base-v2"
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # Faster reranker
+QA_MODEL = "distilbert-base-uncased-distilled-squad"  # Much faster QA model
+
+# ===== FASTAPI APP & IN-MEMORY STORAGE =====
 app = FastAPI(
-    title="HackRx Insurance Q&A API",
-    description="Answer insurance-related questions using RAG and GPT",
-    version="1.0.0"
+    title="Dynamic Document Q&A API",
+    description="Submit a document URL to be indexed, then ask questions.",
+    version="1.0"
 )
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
 )
 
-# Global models
-vector_store = None
-qa_chain = None
-try:
-    print("🔍 Initializing models...")
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    os.environ["OPENAI_API_KEY"] = openai_api_key
+# In-memory storage for the loaded document indexes.
+document_store: Dict[str, Any] = {}
 
-    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
-    chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
+# ===== LOAD MODELS ON STARTUP =====
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🚀 Using device: {device}")
 
-    embeddings = OpenAIEmbeddings(model=embedding_model_name)
-    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
+embeddings_model = HuggingFaceEmbeddings(model_name=EMBED_MODEL, model_kwargs={'device': device})
+reranker = CrossEncoder(RERANK_MODEL, device=device, max_length=512)
+qa_pipeline = pipeline("question-answering", model=QA_MODEL, tokenizer=QA_MODEL, device=0 if device == "cuda" else -1)
 
-    prompt = PromptTemplate.from_template("""
-    You are an expert assistant in insurance policy analysis.
-    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
-    - Do not make assumptions.
-    - Quote directly from the policy when possible.
+print("🔥 Warming up models...")
+_ = qa_pipeline(question="warmup", context="warmup")
+print("✅ Models are ready.")
 
-    Context:
-    {context}
+# ===== API ENDPOINTS =====
+class IndexRequest(BaseModel):
+    document_url: str
 
-    Question: {input}
-    Answer:
-    """)
-
-    qa_chain = create_stuff_documents_chain(llm, prompt)
-    print("✅ Models initialized.")
-except Exception as e:
-    print(f"❌ Error initializing models: {e}")
-
-# Request models
 class QuestionRequest(BaseModel):
-    question: str
-
-class HackRxRequest(BaseModel):
-    documents: str
     questions: List[str]
 
-# Health check route
-@app.get("/")
-def health():
-    return {"status": "API is running"}
-
-# Local testing endpoint
-@app.post("/ask")
-def ask_question(request: QuestionRequest):
-    if not vector_store or not qa_chain:
-        raise HTTPException(status_code=500, detail="Model not loaded.")
-
-    question = request.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    relevant_chunks = vector_store.similarity_search(question, k=12)
-    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
-
+@app.get("/", summary="Health Check")
+def health_check():
+    """Check if the API is running and if a document is indexed."""
     return {
-        "question": question,
-        "answer": response,
-        "source_chunks": [doc.page_content for doc in relevant_chunks]
+        "status": "API is running",
+        "device": device,
+        "document_indexed": "document_url" in document_store,
+        "indexed_document_url": document_store.get("document_url", "None"),
     }
 
-# Async task handler
-async def ask_async(llm_chain, vector_store, question):
-    rel_chunks = vector_store.similarity_search(question, k=12)
-    raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
-    answer = raw.strip()
-    if not answer or "i don't know" in answer.lower():
-        return "The policy document does not specify this clearly."
-    return answer
-
-# HackRx Evaluation Endpoint
-@app.post("/hackrx/run")
-async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
-    expected_token = os.getenv("HACKRX_BEARER_TOKEN")
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-    token = authorization.split("Bearer ")[1]
-    if token != expected_token:
-        raise HTTPException(status_code=403, detail="Invalid token.")
+@app.post("/index_document", summary="1. Index a Document")
+async def index_document(data: IndexRequest):
+    """
+    Downloads a PDF from a URL, processes it, and creates searchable indexes in memory.
+    """
+    global document_store
+    document_store = {} # Clear previous index
 
     try:
-        import time
-        start_time = time.time()
+        print(f"⬇️ Downloading document from: {data.document_url}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            with requests.get(data.document_url, stream=True) as r:
+                r.raise_for_status()
+                for chunk in r.iter_content(chunk_size=8192):
+                    tmp_file.write(chunk)
+            tmp_file_path = tmp_file.name
 
-        # Download and save PDF
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            response = requests.get(data.documents)
-            tmp.write(response.content)
-            tmp_path = tmp.name
-
-        # Load and filter document
-        loader = PyMuPDFLoader(tmp_path)
+        print("📄 Loading and splitting PDF into chunks...")
+        loader = PyMuPDFLoader(tmp_file_path)
         docs = loader.load()
-        docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
-
-        # Determine chunk size based on page count
-        page_count = len(docs)
-        if page_count <= 5:
-            chunk_size = 600
-        elif page_count <= 10:
-            chunk_size = 800
-        else:
-            chunk_size = 1000
-
-        # Optimized chunking
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=100,
-            separators=["\n\n", "\n", ".", " "]
-        )
+        splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
         chunks = splitter.split_documents(docs)
-        print(f"📄 Chunks created (before limit): {len(chunks)}")
+        texts = [c.page_content for c in chunks]
 
-        # Cap chunk count
-        max_chunks = 300
-        chunks = chunks[:max_chunks]
-        print(f"📄 Chunks used: {len(chunks)}")
+        if not texts:
+            raise HTTPException(status_code=400, detail="Could not extract text from the document.")
 
-        # Temporary FAISS vector store
-        embeddings_model = OpenAIEmbeddings(model="text-embedding-ada-002")
-        temp_vector_store = FAISS.from_documents(chunks, embeddings_model)
+        print(f"🧠 Building FAISS and BM25 indexes for {len(texts)} chunks...")
+        vector_store = FAISS.from_texts(texts, embeddings_model)
+        tokenized_corpus = [doc.lower().split() for doc in texts]
+        bm25 = BM25Okapi(tokenized_corpus)
 
-        # Async answering
-        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
-        answers = await asyncio.gather(*tasks)
-
-        total_time = time.time() - start_time
-        print(f"⏱ Total Time: {total_time:.2f} sec")
-
-        return {
-            "status": "success",
-            "answers": answers
+        document_store = {
+            "document_url": data.document_url,
+            "vector_store": vector_store,
+            "bm25": bm25,
+            "texts": texts,
         }
+        print("✅ Indexing complete and ready for questions.")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to index document: {str(e)}")
+    finally:
+        if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
+
+    return {
+        "status": "success",
+        "message": f"Document from {data.document_url} indexed successfully.",
+        "chunks_created": len(texts)
+    }
+
+@app.post("/ask", summary="2. Ask Questions")
+async def ask_questions(data: QuestionRequest):
+    """
+    Answers questions based on the currently indexed document.
+    """
+    if "vector_store" not in document_store:
+        raise HTTPException(status_code=400, detail="No document is indexed. Please call /index_document first.")
+
+    answers = await asyncio.gather(*[answer_question(q) for q in data.questions if q.strip()])
+    return {"status": "success", "answers": answers}
+
+# ===== HELPER FUNCTIONS (SEARCH & QA LOGIC) =====
+def hybrid_search(query: str) -> List[str]:
+    faiss_hits = document_store["vector_store"].similarity_search(query, k=TOP_K_FAISS)
+    
+    bm25_scores = document_store["bm25"].get_scores(query.lower().split())
+    bm25_hits = sorted(zip(document_store["texts"], bm25_scores), key=lambda x: x[1], reverse=True)[:TOP_K_BM25]
+
+    candidates = [(doc.page_content, query) for doc in faiss_hits]
+    candidates += [(text, query) for text, _ in bm25_hits]
+    unique_candidates = list(dict.fromkeys(candidates))
+
+    scores = reranker.predict(unique_candidates, batch_size=32, show_progress_bar=False)
+    ranked = sorted(zip(unique_candidates, scores), key=lambda x: x[1], reverse=True)[:FINAL_TOP_K]
+
+    return [text for (text, _), _ in ranked]
+
+async def answer_question(question: str) -> str:
+    context_passages = hybrid_search(question)
+    context = " ".join(context_passages)[:CONTEXT_LIMIT]
+    
+    if not context.strip():
+        return "Could not find relevant context to answer the question."
+        
+    result = qa_pipeline(question=question, context=context)
+    return result["answer"].strip()
