@@ -18,6 +18,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 import nltk
 from nltk.tokenize import sent_tokenize
+
+# Ensure nltk resources are available
 nltk.download('punkt')
 
 # Load environment variables
@@ -37,6 +39,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize LLM and QA chain
 vector_store = None
 qa_chain = None
 try:
@@ -107,7 +110,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         docs = loader.load()
         docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
 
-        # Intelligent chunking
+        # Intelligent chunk size based on doc length
         page_count = len(docs)
         chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
 
@@ -117,17 +120,17 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             separators=["\n\n", "\n", ".", " "]
         )
 
-        # Preserve sentence integrity during chunking
+        # Sentence-preserving splitting
         combined_text = "\n".join([doc.page_content for doc in docs])
         sentences = sent_tokenize(combined_text)
         pseudo_docs = [{"page_content": s} for s in sentences if len(s.strip()) > 30]
-
         chunks = text_splitter.split_documents(pseudo_docs)
         print(f"📄 Chunks created: {len(chunks)}")
 
         embeddings_model = OpenAIEmbeddings(model="text-embedding-ada-002")
         temp_vector_store = FAISS.from_documents(chunks, embeddings_model)
 
+        # Filter top relevant chunks
         used_chunk_content = set()
         for question in data.questions:
             results = temp_vector_store.similarity_search(question.strip(), k=12)
