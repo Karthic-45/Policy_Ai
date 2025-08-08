@@ -12,10 +12,13 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
 from langchain.document_loaders import PyMuPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+import nltk
+from nltk.tokenize import sent_tokenize
 
 # Load environment variables
 load_dotenv()
+nltk.download('punkt')
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -84,6 +87,24 @@ async def ask_async(llm_chain, vector_store, question):
         return "The policy document does not specify this clearly."
     return answer
 
+# Sentence-aware chunker
+def sentence_chunker(docs, max_chunk_size=1000):
+    final_chunks = []
+
+    for doc in docs:
+        sentences = sent_tokenize(doc.page_content.strip())
+        current_chunk = ""
+        for sent in sentences:
+            if len(current_chunk) + len(sent) + 1 <= max_chunk_size:
+                current_chunk += " " + sent
+            else:
+                final_chunks.append(Document(page_content=current_chunk.strip(), metadata=doc.metadata))
+                current_chunk = sent
+        if current_chunk:
+            final_chunks.append(Document(page_content=current_chunk.strip(), metadata=doc.metadata))
+
+    return final_chunks
+
 # HackRx evaluation endpoint
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
@@ -113,12 +134,8 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         page_count = len(docs)
         chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=100,
-            separators=["\n\n", "\n", ".", " "]
-        )
-        chunks = splitter.split_documents(docs)
+        # Sentence-aware chunking
+        chunks = sentence_chunker(docs, max_chunk_size=chunk_size)
         print(f"📄 Chunks created: {len(chunks)}")
 
         # Build temporary vector store
