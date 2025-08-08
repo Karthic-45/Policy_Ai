@@ -1,27 +1,33 @@
-# --- Core Backend ---
+# --- Core Backend Framework ---
+# For building and running the web server
 fastapi
 uvicorn[standard]
 
-# --- Environment Variables ---
+# --- Configuration ---
+# For managing environment variables (e.g., API keys)
 python-dotenv
 
-# --- LangChain Core & OpenAI Integration ---
+# --- LangChain & AI Integrations ---
+# The core LangChain library and specific integration for OpenAI
 langchain>=0.2.0
-langchain-core
 langchain-openai
-langchain-community
 
-# --- Embeddings and Vector DB ---
-openai
-faiss-cpu
-
-# --- PDF Loading and Data Handling ---
+# --- Data Handling & Validation ---
+# For parsing PDFs and validating data models
 PyMuPDF
 pydantic
 
-# --- Token Counting (for OpenAI models) ---
+# --- Vector Store ---
+# For creating and searching through vector embeddings on the CPU
+# For a GPU server, replace this with 'faiss-gpu'
+faiss-cpu
+
+# --- Essential Dependencies ---
+# Required for making HTTP requests (e.g., to download files)
+requests
+
+# For token counting with OpenAI models
 tiktoken
 
-# --- Extra dependency for this setup ---
-requests
+# Required by many embedding models and underlying ML frameworks
 torch
