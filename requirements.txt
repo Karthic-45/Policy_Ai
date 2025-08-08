@@ -25,5 +25,5 @@ tiktoken
 # --- Cosine Similarity ---
 scikit-learn
 
-# --- NLTK for sentence chunking ---
-nltk
+# --- spaCy for sentence chunking ---
+spacy
