@@ -12,6 +12,354 @@ FastAPI application that:
 - Returns JSON with answers and short provenance (quoted snippets)
 - Cleans up all temp files & indexes after responding
 """
+"""
+app.py - Debug-friendly HackRx Retrieval Q&A (Full RAG)
+"""
+
+import os
+import time
+import asyncio
+import traceback
+from typing import List, Union, Optional
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain.chains.combine_documents import create_stuff_documents_chain
+
+from create_index import (
+    build_page_index_from_pdf_sources,
+    select_top_pages_for_questions,
+    build_chunk_index_from_selected_page_texts,
+)
+
+# ------------------------
+# Load env
+# ------------------------
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set in environment.")
+
+# ------------------------
+# App + Models
+# ------------------------
+app = FastAPI(title="HackRx Retrieval Q&A (Full RAG)", version="1.0")
+
+class HackRxRequest(BaseModel):
+    documents: Union[str, List[str]]  # URL or list of URLs
+    questions: List[str]
+
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.0)
+
+PROMPT = PromptTemplate.from_template(
+    """
+You are an expert insurance policy analyst. Use ONLY the provided document excerpts.
+- When quoting, wrap the quote in double quotes.
+- If document doesn't specify, reply exactly: "The policy document does not specify this clearly."
+- Provide a short rationale (1-2 sentences) explaining how the quoted excerpt supports the answer.
+Keep answers concise.
+Context:
+{context}
+
+Question: {input}
+Answer:
+"""
+)
+qa_chain = create_stuff_documents_chain(llm, PROMPT)
+
+EXPECTED_BEARER = "cff339776dc80b453cdfbfa2f4e8dbafe3fa28e3c05fcebba73c46680c8bf594"
+
+# ------------------------
+# Endpoint
+# ------------------------
+@app.post("/hackrx/run")
+async def hackrx_run(req: HackRxRequest, authorization: Optional[str] = Header(None)):
+    """Process provided PDFs and answer questions using GPT-4 with RAG."""
+    # -------------------
+    # Auth check
+    # -------------------
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header.")
+    token = authorization.split("Bearer ")[1]
+    if token != EXPECTED_BEARER:
+        raise HTTPException(status_code=403, detail="Invalid bearer token.")
+
+    # -------------------
+    # Normalize docs
+    # -------------------
+    if isinstance(req.documents, str):
+        sources = [req.documents]
+    elif isinstance(req.documents, list):
+        sources = req.documents
+    else:
+        raise HTTPException(status_code=400, detail="documents must be a URL string or list of URLs.")
+
+    if not sources:
+        raise HTTPException(status_code=400, detail="No document URLs provided.")
+
+    start_total = time.time()
+    meta = {
+        "num_input_documents": len(sources),
+        "pages_embedded_for_page_index": 0,
+        "selected_pages_for_chunking": 0,
+        "chunks_created": 0,
+        "time_seconds": None,
+    }
+
+    page_index = None
+    chunk_index = None
+
+    try:
+        print("\n[Stage 1] Building page-level index...")
+        page_index, pages_selected = build_page_index_from_pdf_sources(sources)
+        meta["pages_embedded_for_page_index"] = len(pages_selected)
+        print(f"✔ Page index built with {meta['pages_embedded_for_page_index']} pages.")
+
+        print("\n[Stage 2] Selecting top pages for questions...")
+        selected_texts = select_top_pages_for_questions(page_index, req.questions)
+        meta["selected_pages_for_chunking"] = len(selected_texts)
+        print(f"✔ Selected {meta['selected_pages_for_chunking']} relevant pages.")
+
+        if not selected_texts:
+            print("⚠ No relevant pages found — returning default response.")
+            answers = [{
+                "answer": "The policy document does not specify this clearly.",
+                "provenance": [],
+                "rationale": ""
+            } for _ in req.questions]
+            meta["time_seconds"] = round(time.time() - start_total, 2)
+            return {"answers": answers, "meta": meta}
+
+        print("\n[Stage 3] Building chunk-level index...")
+        chunk_index = build_chunk_index_from_selected_page_texts(selected_texts)
+        try:
+            meta["chunks_created"] = len(getattr(chunk_index, "docstore")._dict)
+        except Exception:
+            meta["chunks_created"] = "unknown"
+        print(f"✔ Chunk index built with {meta['chunks_created']} chunks.")
+
+        print("\n[Stage 4] Retrieving & answering questions...")
+        async def answer_one(q: str):
+            qlen = len(q.strip())
+            k = 6 if qlen < 40 else (10 if qlen < 120 else 14)
+            top_docs = chunk_index.similarity_search(q, k=k)
+            context_docs = top_docs[:3] if len(top_docs) > 3 else top_docs
+
+            try:
+                raw = await qa_chain.ainvoke({"context": context_docs, "input": q})
+            except Exception:
+                raw = qa_chain.invoke({"context": context_docs, "input": q})
+
+            ans_text = raw.strip() if raw.strip() else "The policy document does not specify this clearly."
+            provenance = []
+            for d in context_docs:
+                snippet = (d.page_content.strip()[:200] + "...") if len(d.page_content.strip()) > 200 else d.page_content.strip()
+                if snippet:
+                    provenance.append(snippet)
+            rationale = f"Used {len(context_docs)} relevant excerpt(s) from the document to answer."
+            return {"answer": ans_text, "provenance": provenance, "rationale": rationale}
+
+        answers = await asyncio.gather(*[answer_one(q) for q in req.questions])
+
+        meta["time_seconds"] = round(time.time() - start_total, 2)
+        print("✔ All questions answered.")
+
+        return {"answers": answers, "meta": meta}
+
+    except Exception as e:
+        print("\n❌ Processing error:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Processing error: {e}")
+
+    finally:
+        print("\n[Cleanup] Releasing resources...")
+        try:
+            if page_index:
+                del page_index
+            if chunk_index:
+                del chunk_index
+        except Exception:
+            pass
+"""
+app.py - Debug-friendly HackRx Retrieval Q&A (Full RAG)
+"""
+
+import os
+import time
+import asyncio
+import traceback
+from typing import List, Union, Optional
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain.chains.combine_documents import create_stuff_documents_chain
+
+from create_index import (
+    build_page_index_from_pdf_sources,
+    select_top_pages_for_questions,
+    build_chunk_index_from_selected_page_texts,
+)
+
+# ------------------------
+# Load env
+# ------------------------
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set in environment.")
+
+# ------------------------
+# App + Models
+# ------------------------
+app = FastAPI(title="HackRx Retrieval Q&A (Full RAG)", version="1.0")
+
+class HackRxRequest(BaseModel):
+    documents: Union[str, List[str]]  # URL or list of URLs
+    questions: List[str]
+
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.0)
+
+PROMPT = PromptTemplate.from_template(
+    """
+You are an expert insurance policy analyst. Use ONLY the provided document excerpts.
+- When quoting, wrap the quote in double quotes.
+- If document doesn't specify, reply exactly: "The policy document does not specify this clearly."
+- Provide a short rationale (1-2 sentences) explaining how the quoted excerpt supports the answer.
+Keep answers concise.
+Context:
+{context}
+
+Question: {input}
+Answer:
+"""
+)
+qa_chain = create_stuff_documents_chain(llm, PROMPT)
+
+EXPECTED_BEARER = "cff339776dc80b453cdfbfa2f4e8dbafe3fa28e3c05fcebba73c46680c8bf594"
+
+# ------------------------
+# Endpoint
+# ------------------------
+@app.post("/hackrx/run")
+async def hackrx_run(req: HackRxRequest, authorization: Optional[str] = Header(None)):
+    """Process provided PDFs and answer questions using GPT-4 with RAG."""
+    # -------------------
+    # Auth check
+    # -------------------
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header.")
+    token = authorization.split("Bearer ")[1]
+    if token != EXPECTED_BEARER:
+        raise HTTPException(status_code=403, detail="Invalid bearer token.")
+
+    # -------------------
+    # Normalize docs
+    # -------------------
+    if isinstance(req.documents, str):
+        sources = [req.documents]
+    elif isinstance(req.documents, list):
+        sources = req.documents
+    else:
+        raise HTTPException(status_code=400, detail="documents must be a URL string or list of URLs.")
+
+    if not sources:
+        raise HTTPException(status_code=400, detail="No document URLs provided.")
+
+    start_total = time.time()
+    meta = {
+        "num_input_documents": len(sources),
+        "pages_embedded_for_page_index": 0,
+        "selected_pages_for_chunking": 0,
+        "chunks_created": 0,
+        "time_seconds": None,
+    }
+
+    page_index = None
+    chunk_index = None
+
+    try:
+        print("\n[Stage 1] Building page-level index...")
+        page_index, pages_selected = build_page_index_from_pdf_sources(sources)
+        meta["pages_embedded_for_page_index"] = len(pages_selected)
+        print(f"✔ Page index built with {meta['pages_embedded_for_page_index']} pages.")
+
+        print("\n[Stage 2] Selecting top pages for questions...")
+        selected_texts = select_top_pages_for_questions(page_index, req.questions)
+        meta["selected_pages_for_chunking"] = len(selected_texts)
+        print(f"✔ Selected {meta['selected_pages_for_chunking']} relevant pages.")
+
+        if not selected_texts:
+            print("⚠ No relevant pages found — returning default response.")
+            answers = [{
+                "answer": "The policy document does not specify this clearly.",
+                "provenance": [],
+                "rationale": ""
+            } for _ in req.questions]
+            meta["time_seconds"] = round(time.time() - start_total, 2)
+            return {"answers": answers, "meta": meta}
+
+        print("\n[Stage 3] Building chunk-level index...")
+        chunk_index = build_chunk_index_from_selected_page_texts(selected_texts)
+        try:
+            meta["chunks_created"] = len(getattr(chunk_index, "docstore")._dict)
+        except Exception:
+            meta["chunks_created"] = "unknown"
+        print(f"✔ Chunk index built with {meta['chunks_created']} chunks.")
+
+        print("\n[Stage 4] Retrieving & answering questions...")
+        async def answer_one(q: str):
+            qlen = len(q.strip())
+            k = 6 if qlen < 40 else (10 if qlen < 120 else 14)
+            top_docs = chunk_index.similarity_search(q, k=k)
+            context_docs = top_docs[:3] if len(top_docs) > 3 else top_docs
+
+            try:
+                raw = await qa_chain.ainvoke({"context": context_docs, "input": q})
+            except Exception:
+                raw = qa_chain.invoke({"context": context_docs, "input": q})
+
+            ans_text = raw.strip() if raw.strip() else "The policy document does not specify this clearly."
+            provenance = []
+            for d in context_docs:
+                snippet = (d.page_content.strip()[:200] + "...") if len(d.page_content.strip()) > 200 else d.page_content.strip()
+                if snippet:
+                    provenance.append(snippet)
+            rationale = f"Used {len(context_docs)} relevant excerpt(s) from the document to answer."
+            return {"answer": ans_text, "provenance": provenance, "rationale": rationale}
+
+        answers = await asyncio.gather(*[answer_one(q) for q in req.questions])
+
+        meta["time_seconds"] = round(time.time() - start_total, 2)
+        print("✔ All questions answered.")
+
+        return {"answers": answers, "meta": meta}
+
+    except Exception as e:
+        print("\n❌ Processing error:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Processing error: {e}")
+
+    finally:
+        print("\n[Cleanup] Releasing resources...")
+        try:
+            if page_index:
+                del page_index
+            if chunk_index:
+                del chunk_index
+        except Exception:
+            pass
 
 import os
 import time
