@@ -1,14 +1,5 @@
-# --------------------------------------------------------------------------
-# INSTRUCTIONS
-# 1. IMPORTANT: First, install PyTorch with CUDA support. Go to the
-#    official PyTorch website (https://pytorch.org/get-started/locally/)
-#    and get the correct command for your system (OS, Package, CUDA Version).
-#    The command will look something like this:
-#    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-#
-# 2. After PyTorch is installed, install all other packages using this file:
-#    pip install -r requirements.txt
-# --------------------------------------------------------------------------
+# --- Find CPU-only packages from this special index ---
+--index-url https://download.pytorch.org/whl/cpu
 
 # --- Core Backend Framework ---
 fastapi
@@ -18,24 +9,22 @@ uvicorn[standard]
 python-dotenv
 
 # --- LangChain & AI Integrations ---
-# Core library and specific integrations. This resolves the previous conflict.
 langchain>=0.2.0
 langchain-openai
 langchain-community
 
-# --- Local Embeddings ---
-# For running embedding models locally on your GPU
-InstructorEmbedding
+# --- Local Embeddings & ML ---
+torch # This will now be a small CPU version
 sentence-transformers
-accelerate # Helps optimize Hugging Face model loading
+InstructorEmbedding
+accelerate
 
 # --- Document Processing ---
 PyMuPDF
 
-# --- Vector Store (GPU Version) ---
-# For a CPU-only server, change this to 'faiss-cpu'
+# --- Vector Store (CPU Version) ---
 faiss-cpu
 
 # --- Essential Dependencies ---
-requests  # For making HTTP requests
-tiktoken  # Tokenizer for OpenAI models
+requests
+tiktoken
