@@ -19,11 +19,8 @@ faiss-cpu
 PyMuPDF
 pydantic
 
-# --- Token Counting ---
+# --- Token Counting (for OpenAI models) ---
 tiktoken
 
 # --- Cosine Similarity ---
 scikit-learn
-
-# --- spaCy for sentence chunking ---
-spacy
