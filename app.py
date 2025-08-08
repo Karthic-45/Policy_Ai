@@ -78,25 +78,6 @@ class HackRxRequest(BaseModel):
 def health():
     return {"status": "API is running"}
 
-# Local testing endpoint
-@app.post("/ask")
-def ask_question(request: QuestionRequest):
-    if not vector_store or not qa_chain:
-        raise HTTPException(status_code=500, detail="Model not loaded.")
-
-    question = request.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    relevant_chunks = vector_store.similarity_search(question, k=12)
-    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
-
-    return {
-        "question": question,
-        "answer": response,
-        "source_chunks": [doc.page_content for doc in relevant_chunks]
-    }
-
 # Async task handler
 async def ask_async(llm_chain, vector_store, question):
     rel_chunks = vector_store.similarity_search(question, k=12)
@@ -151,7 +132,8 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
         # Cap chunk count
         max_chunks = 300
-        chunks = chunks[:max_chunks]
+        if len(chunks) > max_chunks:
+            chunks = chunks[:max_chunks]
         print(f"📄 Chunks used: {len(chunks)}")
 
         # Temporary FAISS vector store
@@ -159,7 +141,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         temp_vector_store = FAISS.from_documents(chunks, embeddings_model)
 
         # Async answering
-        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
+        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions if q.strip()]
         answers = await asyncio.gather(*tasks)
 
         total_time = time.time() - start_time
