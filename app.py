@@ -2,11 +2,13 @@ import os
 import tempfile
 import asyncio
 import requests
+import time
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -17,167 +19,131 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 # Load environment variables
 load_dotenv()
 
-# Initialize FastAPI app
+# FastAPI app setup
 app = FastAPI(
-    title="HackRx Insurance Q&A API",
-    description="Answer insurance-related questions using RAG and GPT",
-    version="1.0.0"
+    title="HackRx Production API",
+    description="Insurance Q&A with GPT + FAISS + OpenAI",
+    version="1.0"
 )
 
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global models
-vector_store = None
-qa_chain = None
-try:
-    print("🔍 Initializing models...")
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    os.environ["OPENAI_API_KEY"] = openai_api_key
+# Environment variables
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
 
-    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
-    chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
+# Models
+embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.1)
 
-    embeddings = OpenAIEmbeddings(model=embedding_model_name)
-    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
+prompt = PromptTemplate.from_template("""
+You are an expert assistant in insurance policy analysis.
+Use the extracted context from the insurance policy to answer the question accurately and concisely.
+- Do not make assumptions.
+- Quote the policy when possible.
 
-    prompt = PromptTemplate.from_template("""
-    You are an expert assistant in insurance policy analysis.
-    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
-    - Do not make assumptions.
-    - Quote directly from the policy when possible.
+Context:
+{context}
 
-    Context:
-    {context}
+Question: {input}
+Answer:
+""")
 
-    Question: {input}
-    Answer:
-    """)
+qa_chain = create_stuff_documents_chain(llm, prompt)
 
-    qa_chain = create_stuff_documents_chain(llm, prompt)
-    print("✅ Models initialized.")
-except Exception as e:
-    print(f"❌ Error initializing models: {e}")
-
-# Request models
-class QuestionRequest(BaseModel):
-    question: str
-
+# Request model
 class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# Health check route
+# Health check
 @app.get("/")
 def health():
-    return {"status": "API is running"}
+    return {"status": "up"}
 
-# Local testing endpoint
-@app.post("/ask")
-def ask_question(request: QuestionRequest):
-    if not vector_store or not qa_chain:
-        raise HTTPException(status_code=500, detail="Model not loaded.")
+# Async QA function
+def batch_embed_chunks(chunks, batch_size=20):
+    batched = [chunks[i:i + batch_size] for i in range(0, len(chunks), batch_size)]
+    all_embeddings = []
+    for batch in batched:
+        all_embeddings.extend(embeddings.embed_documents([doc.page_content for doc in batch]))
+    return all_embeddings
 
-    question = request.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    relevant_chunks = vector_store.similarity_search(question, k=12)
-    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
-
-    return {
-        "question": question,
-        "answer": response,
-        "source_chunks": [doc.page_content for doc in relevant_chunks]
-    }
-
-# Async task handler
 async def ask_async(llm_chain, vector_store, question):
     rel_chunks = vector_store.similarity_search(question, k=12)
-
-    # ✅ Handle empty results
-    if not rel_chunks:
-        return "The policy document does not contain relevant information for this question."
-
     raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
-    answer = raw.strip()
+
+    if isinstance(raw, dict) and "output_text" in raw:
+        answer = raw["output_text"]
+    elif isinstance(raw, str):
+        answer = raw
+    else:
+        answer = str(raw)
+
+    answer = answer.strip()
     if not answer or "i don't know" in answer.lower():
         return "The policy document does not specify this clearly."
     return answer
 
-# HackRx Evaluation Endpoint
+# Main route
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
-    expected_token = os.getenv("HACKRX_BEARER_TOKEN")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+
     token = authorization.split("Bearer ")[1]
-    if token != expected_token:
+    if token != HACKRX_BEARER_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token.")
 
     try:
-        import time
         start_time = time.time()
 
-        # Download and save PDF
+        # Download PDF
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             response = requests.get(data.documents)
+            if response.status_code != 200:
+                raise HTTPException(status_code=400, detail="Unable to download document.")
             tmp.write(response.content)
             tmp_path = tmp.name
 
-        # Load and filter document
+        # Load and clean pages
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
-        docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
+        docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
 
-        # Determine chunk size based on page count
+        # Adaptive chunking
         page_count = len(docs)
-        if page_count <= 5:
-            chunk_size = 600
-        elif page_count <= 10:
-            chunk_size = 800
-        else:
-            chunk_size = 1000
-
-        # Optimized chunking
+        chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=100,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
-        print(f"📄 Chunks created (before limit): {len(chunks)}")
+        chunks = chunks[:300]  # Limit to top 300 chunks
 
-        # Cap chunk count
-        max_chunks = 300
-        chunks = chunks[:max_chunks]
-        print(f"📄 Chunks used: {len(chunks)}")
+        # FAISS index
+        temp_vector_store = FAISS.from_documents(chunks, embeddings)
 
-        # ✅ Prevent empty vector store creation
-        if not chunks:
-            raise HTTPException(status_code=400, detail="The document does not contain enough content to process.")
-
-        # Temporary FAISS vector store
-        embeddings_model = OpenAIEmbeddings(model="text-embedding-ada-002")
-        temp_vector_store = FAISS.from_documents(chunks, embeddings_model)
-
-        # Async answering
+        # Answer questions
         tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
-        total_time = time.time() - start_time
-        print(f"⏱️ Total Time: {total_time:.2f} sec")
-
+        duration = round(time.time() - start_time, 2)
         return {
             "status": "success",
-            "answers": answers
+            "answers": answers,
+           
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
