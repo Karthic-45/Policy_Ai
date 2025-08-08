@@ -17,8 +17,15 @@ from langchain_core.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
+# ✅ Safe loading of spaCy model
 import spacy
-nlp = spacy.load("en_core_web_sm")  # Load spaCy's English model
+from spacy.cli import download
+
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
 
 # Load environment variables
 load_dotenv()
@@ -99,6 +106,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         import time
         start_time = time.time()
 
+        # Download and load PDF
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             response = requests.get(data.documents)
             tmp.write(response.content)
@@ -108,7 +116,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         docs = loader.load()
         docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
 
-        # Intelligent chunk size based on doc length
+        # Adjust chunking based on page count
         page_count = len(docs)
         chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
 
@@ -118,11 +126,12 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             separators=["\n\n", "\n", ".", " "]
         )
 
-        # Sentence-preserving splitting using spaCy
+        # ✅ spaCy sentence splitting
         combined_text = "\n".join([doc.page_content for doc in docs])
         doc_nlp = nlp(combined_text)
         sentences = [sent.text.strip() for sent in doc_nlp.sents if len(sent.text.strip()) > 30]
         pseudo_docs = [Document(page_content=sent) for sent in sentences]
+
         chunks = text_splitter.split_documents(pseudo_docs)
         print(f"📄 Chunks created: {len(chunks)}")
 
