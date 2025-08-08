@@ -1,167 +1,139 @@
 import os
+import time
 import asyncio
-import tempfile
-import requests
-import torch
-from pathlib import Path
-from typing import List, Dict, Any, Optional
+import logging
 
+import requests
+import fitz  # PyMuPDF
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.chains import RetrievalQA
+from langchain_community.embeddings import HuggingFaceInstructEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_community.docstore.document import Document
+from langchain_openai import ChatOpenAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder
-from transformers import pipeline, logging
 
-# Suppress verbose transformer warnings
-logging.set_verbosity_error()
+# -----------------------------
+# Configuration for GPU
+# -----------------------------
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("hackrx-gpu")
 
-# ===== CONFIG (Tuned for Hackathon Speed) =====
-TOP_K_FAISS = 8
-TOP_K_BM25 = 8
-FINAL_TOP_K = 10
-CONTEXT_LIMIT = 3000  # Chars
+# --- Model and API Configuration ---
+# Set device to 'cuda' to leverage the GPU
+DEVICE = "cuda"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "hkunlp/instructor-large") # Using larger model for better accuracy
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-3.5-turbo")
+HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
 
-# Model choices for speed vs. accuracy tradeoff
-EMBED_MODEL = "sentence-transformers/all-mpnet-base-v2"
-RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # Faster reranker
-QA_MODEL = "distilbert-base-uncased-distilled-squad"  # Much faster QA model
+# --- Performance & Quality Knobs ---
+# With a GPU, we can afford to process the whole document.
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 150
+TOP_K_CHUNKS = 5 # Retrieve more chunks for better context for the LLM
 
-# ===== FASTAPI APP & IN-MEMORY STORAGE =====
+# -----------------------------
+# FastAPI App Setup
+# -----------------------------
 app = FastAPI(
-    title="Dynamic Document Q&A API",
-    description="Submit a document URL to be indexed, then ask questions.",
-    version="1.0"
+    title="HackRx GPU Version",
+    description="Insurance Q&A optimized for GPU execution for maximum accuracy and speed.",
+    version="3.0-gpu"
 )
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
-)
+class HackRxRequest(BaseModel):
+    documents: str
+    questions: list[str]
 
-# In-memory storage for the loaded document indexes.
-document_store: Dict[str, Any] = {}
-
-# ===== LOAD MODELS ON STARTUP =====
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"🚀 Using device: {device}")
-
-embeddings_model = HuggingFaceEmbeddings(model_name=EMBED_MODEL, model_kwargs={'device': device})
-reranker = CrossEncoder(RERANK_MODEL, device=device, max_length=512)
-qa_pipeline = pipeline("question-answering", model=QA_MODEL, tokenizer=QA_MODEL, device=0 if device == "cuda" else -1)
-
-print("🔥 Warming up models...")
-_ = qa_pipeline(question="warmup", context="warmup")
-print("✅ Models are ready.")
-
-# ===== API ENDPOINTS =====
-class IndexRequest(BaseModel):
-    document_url: str
-
-class QuestionRequest(BaseModel):
-    questions: List[str]
-
-@app.get("/", summary="Health Check")
-def health_check():
-    """Check if the API is running and if a document is indexed."""
-    return {
-        "status": "API is running",
-        "device": device,
-        "document_indexed": "document_url" in document_store,
-        "indexed_document_url": document_store.get("document_url", "None"),
-    }
-
-@app.post("/index_document", summary="1. Index a Document")
-async def index_document(data: IndexRequest):
+# -----------------------------
+# Core Logic & Helper Functions
+# -----------------------------
+async def build_retriever_from_url(pdf_url: str):
     """
-    Downloads a PDF from a URL, processes it, and creates searchable indexes in memory.
+    Builds a retriever by processing all pages of a PDF from a URL.
+    This function is designed to run in a separate thread to not block the FastAPI event loop.
     """
-    global document_store
-    document_store = {} # Clear previous index
+    def process_sync():
+        logger.info(f"Downloading PDF from {pdf_url}")
+        response = requests.get(pdf_url, timeout=60)
+        response.raise_for_status()
 
+        logger.info("Opening PDF and extracting all pages...")
+        doc = fitz.open(stream=response.content, filetype="pdf")
+        # NOTE: The page triage is removed. We process ALL pages for maximum accuracy.
+        docs_to_process = [
+            Document(page_content=page.get_text("text"), metadata={"page": i + 1})
+            for i, page in enumerate(doc) if page.get_text("text").strip()
+        ]
+        doc.close()
+        logger.info(f"Extracted {len(docs_to_process)} non-empty pages from the document.")
+
+        if not docs_to_process:
+            raise ValueError("Document appears to be empty or could not be read.")
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        chunks = text_splitter.split_documents(docs_to_process)
+        logger.info(f"Created {len(chunks)} text chunks.")
+
+        if not chunks:
+            raise ValueError("Could not create any text chunks from the document.")
+
+        logger.info(f"Loading embedding model '{EMBEDDING_MODEL}' onto GPU device '{DEVICE}'...")
+        # This will run on the GPU, making it orders of magnitude faster than the CPU version.
+        embeddings = HuggingFaceInstructEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={"device": DEVICE}
+        )
+
+        logger.info("Creating FAISS vector store on GPU...")
+        # FAISS.from_documents will now be significantly faster.
+        vector_store = FAISS.from_documents(chunks, embeddings)
+        return vector_store.as_retriever(search_kwargs={"k": TOP_K_CHUNKS})
+
+    # Run the synchronous, CPU/GPU-bound code in a thread pool
+    return await asyncio.to_thread(process_sync)
+
+# -----------------------------
+# API Endpoints
+# -----------------------------
+@app.get("/")
+def health():
+    return {"status": "up", "device": DEVICE, "embedding_model": EMBEDDING_MODEL}
+
+@app.post("/hackrx/run")
+async def hackrx_run(data: HackRxRequest, authorization: Header(None)):
+    if HACKRX_BEARER_TOKEN and (not authorization or f"Bearer {HACKRX_BEARER_TOKEN}" != authorization):
+        raise HTTPException(status_code=403, detail="Invalid token.")
+
+    start_time = time.time()
     try:
-        print(f"⬇️ Downloading document from: {data.document_url}")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            with requests.get(data.document_url, stream=True) as r:
-                r.raise_for_status()
-                for chunk in r.iter_content(chunk_size=8192):
-                    tmp_file.write(chunk)
-            tmp_file_path = tmp_file.name
+        # Pass the PDF URL and questions to the builder
+        retriever = await build_retriever_from_url(data.documents)
 
-        print("📄 Loading and splitting PDF into chunks...")
-        loader = PyMuPDFLoader(tmp_file_path)
-        docs = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
-        chunks = splitter.split_documents(docs)
-        texts = [c.page_content for c in chunks]
+        llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.1)
+        qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
 
-        if not texts:
-            raise HTTPException(status_code=400, detail="Could not extract text from the document.")
+        async def run_query(question):
+            result = await qa_chain.ainvoke({"query": question})
+            answer = result.get('result', "No answer found.").strip()
+            # A more robust fallback answer
+            return answer if answer and "don't know" not in answer.lower() else "The policy document does not seem to contain information about this."
 
-        print(f"🧠 Building FAISS and BM25 indexes for {len(texts)} chunks...")
-        vector_store = FAISS.from_texts(texts, embeddings_model)
-        tokenized_corpus = [doc.lower().split() for doc in texts]
-        bm25 = BM25Okapi(tokenized_corpus)
+        # Run all questions concurrently
+        tasks = [run_query(q) for q in data.questions if q.strip()]
+        answers = await asyncio.gather(*tasks)
 
-        document_store = {
-            "document_url": data.document_url,
-            "vector_store": vector_store,
-            "bm25": bm25,
-            "texts": texts,
-        }
-        print("✅ Indexing complete and ready for questions.")
+        duration = round(time.time() - start_time, 2)
+        logger.info(f"Request completed in {duration} seconds.")
+
+        return {"status": "success", "answers": answers, "time_sec": duration}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to index document: {str(e)}")
-    finally:
-        if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
-            os.unlink(tmp_file_path)
-
-    return {
-        "status": "success",
-        "message": f"Document from {data.document_url} indexed successfully.",
-        "chunks_created": len(texts)
-    }
-
-@app.post("/ask", summary="2. Ask Questions")
-async def ask_questions(data: QuestionRequest):
-    """
-    Answers questions based on the currently indexed document.
-    """
-    if "vector_store" not in document_store:
-        raise HTTPException(status_code=400, detail="No document is indexed. Please call /index_document first.")
-
-    answers = await asyncio.gather(*[answer_question(q) for q in data.questions if q.strip()])
-    return {"status": "success", "answers": answers}
-
-# ===== HELPER FUNCTIONS (SEARCH & QA LOGIC) =====
-def hybrid_search(query: str) -> List[str]:
-    faiss_hits = document_store["vector_store"].similarity_search(query, k=TOP_K_FAISS)
-    
-    bm25_scores = document_store["bm25"].get_scores(query.lower().split())
-    bm25_hits = sorted(zip(document_store["texts"], bm25_scores), key=lambda x: x[1], reverse=True)[:TOP_K_BM25]
-
-    candidates = [(doc.page_content, query) for doc in faiss_hits]
-    candidates += [(text, query) for text, _ in bm25_hits]
-    unique_candidates = list(dict.fromkeys(candidates))
-
-    scores = reranker.predict(unique_candidates, batch_size=32, show_progress_bar=False)
-    ranked = sorted(zip(unique_candidates, scores), key=lambda x: x[1], reverse=True)[:FINAL_TOP_K]
-
-    return [text for (text, _), _ in ranked]
-
-async def answer_question(question: str) -> str:
-    context_passages = hybrid_search(question)
-    context = " ".join(context_passages)[:CONTEXT_LIMIT]
-    
-    if not context.strip():
-        return "Could not find relevant context to answer the question."
-        
-    result = qa_pipeline(question=question, context=context)
-    return result["answer"].strip()
+        logger.exception("An error occurred during processing.")
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
