@@ -1,79 +1,87 @@
+# create_index.py
 import os
-import time
-from dotenv import load_dotenv
+import tempfile
+import fitz  # PyMuPDF
+from concurrent.futures import ThreadPoolExecutor
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
 
-# 1. Load environment variables from .env file
-env_path = os.path.join(os.path.dirname(__file__), '.env')
-load_dotenv(dotenv_path=env_path)
 
-# 2. Get API key and validate
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY not found in environment. Please check your .env file.")
+def extract_and_chunk(pdf_path, chunk_size=1200, chunk_overlap=100):
+    """Load PDF, chunk text structure-aware, return chunks."""
+    loader = PyMuPDFLoader(pdf_path)
+    docs = loader.load()
 
-# Set API key in environment for LangChain to use
-os.environ["OPENAI_API_KEY"] = openai_api_key
-
-# 3. Define paths
-pdf_folder_path = "./pdf_documents/"  # Folder containing PDFs
-faiss_index_path = "faiss_insurance_index"  # Output index path
-
-# 4. Load all PDF documents
-def load_all_documents(folder_path):
-    all_documents = []
-    if not os.path.exists(folder_path):
-        print(f"Folder '{folder_path}' does not exist.")
-        return None
-
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".pdf"):
-            try:
-                loader = PyMuPDFLoader(os.path.join(folder_path, filename))
-                all_documents.extend(loader.load())
-                print(f"✅ Loaded: {filename}")
-            except Exception as e:
-                print(f"❌ Failed to load {filename}: {e}")
-    return all_documents
-
-# 5. Chunk documents into smaller pieces
-def chunk_documents(documents):
+    # Structure-aware chunking: respects headings & paragraphs
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n## ", "\n### ", "\n\n", "\n", " "],
+        length_function=len
     )
-    return splitter.split_documents(documents)
+    return splitter.split_documents(docs)
 
-# 6. Create and save FAISS index
-def create_and_save_index(chunks, index_path):
-    print("🔧 Creating embeddings...")
-    embeddings = OpenAIEmbeddings()
 
-    print("📦 Building FAISS index...")
-    vector_store = FAISS.from_documents(chunks, embeddings)
+def create_faiss_index(pdf_paths):
+    """Create FAISS index for multiple PDFs efficiently."""
+    all_chunks = []
 
-    vector_store.save_local(index_path)
-    print(f"✅ Index saved at: {index_path}")
+    # Process PDFs in parallel
+    with ThreadPoolExecutor() as executor:
+        results = executor.map(extract_and_chunk, pdf_paths)
+        for chunks in results:
+            all_chunks.extend(chunks)
 
-# 7. Main runner
-if __name__ == "__main__":
-    start = time.time()
+    # Create embeddings + FAISS index
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+    vector_store = FAISS.from_documents(all_chunks, embeddings)
+    return vector_store
 
-    print("📄 Loading documents...")
-    documents = load_all_documents(pdf_folder_path)
 
-    if documents:
-        print("✂️ Splitting documents into chunks...")
-        chunks = chunk_documents(documents)
-        print(f"🔢 Total chunks created: {len(chunks)}")
+def build_index_from_urls(pdf_urls):
+    """Download multiple PDFs, build FAISS index in temp dir."""
+    temp_files = []
 
-        print("💾 Creating and saving vector index...")
-        create_and_save_index(chunks, faiss_index_path)
-    else:
-        print("⚠️ No documents found or failed to load.")
+    try:
+        # Download PDFs to temp dir
+        for url in pdf_urls:
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+            temp_file.write(requests.get(url).content)
+            temp_file.flush()
+            temp_files.append(temp_file.name)
 
-    end = time.time()
-    print(f"⏱️ Done in {end - start:.2f} seconds")
+        # Adaptive chunk size for big PDFs
+        pdf_chunk_size = []
+        for f in temp_files:
+            doc = fitz.open(f)
+            pages = len(doc)
+            if pages > 1000:
+                pdf_chunk_size.append(1800)
+            elif pages > 500:
+                pdf_chunk_size.append(1500)
+            else:
+                pdf_chunk_size.append(1200)
+
+        # Create vector store with adaptive sizes
+        all_chunks = []
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(extract_and_chunk, temp_files[i], pdf_chunk_size[i])
+                for i in range(len(temp_files))
+            ]
+            for f in futures:
+                all_chunks.extend(f.result())
+
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+        vector_store = FAISS.from_documents(all_chunks, embeddings)
+        return vector_store
+
+    finally:
+        # Cleanup
+        for f in temp_files:
+            try:
+                os.unlink(f)
+            except:
+                pass
