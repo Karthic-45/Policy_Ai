@@ -17,11 +17,8 @@ from langchain_core.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
-import nltk
-from nltk.tokenize import sent_tokenize
-
-# Ensure nltk resources are available
-nltk.download('punkt')
+import spacy
+nlp = spacy.load("en_core_web_sm")  # Load spaCy's English model
 
 # Load environment variables
 load_dotenv()
@@ -121,10 +118,11 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             separators=["\n\n", "\n", ".", " "]
         )
 
-        # Sentence-preserving splitting
+        # Sentence-preserving splitting using spaCy
         combined_text = "\n".join([doc.page_content for doc in docs])
-        sentences = sent_tokenize(combined_text)
-        pseudo_docs = [Document(page_content=s) for s in sentences if len(s.strip()) > 30]
+        doc_nlp = nlp(combined_text)
+        sentences = [sent.text.strip() for sent in doc_nlp.sents if len(sent.text.strip()) > 30]
+        pseudo_docs = [Document(page_content=sent) for sent in sentences]
         chunks = text_splitter.split_documents(pseudo_docs)
         print(f"📄 Chunks created: {len(chunks)}")
 
