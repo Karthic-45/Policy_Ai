@@ -1,38 +1,28 @@
-# --- Core Backend Framework ---
+# --- Core Backend ---
 fastapi
 uvicorn[standard]
 
-# --- LangChain & OpenAI Integration ---
+# --- LangChain Core + OpenAI Support ---
 langchain>=0.2.0
-langchain-community
+langchain-core
 langchain-openai
+langchain-community
+openai
 
-# --- Embeddings & Model Handling ---
-torch
-sentence-transformers
-accelerate
+# --- Embeddings & Vector Store (CPU version) ---
+faiss-cpu
+tiktoken
+scikit-learn
 
-# --- Document Processing ---
-PyMuPDF
-docx2txt
-python-pptx
-pandas
-openpyxl
-html2text
-beautifulsoup4
-pypandoc
-python-magic
-unstructured
-
-# --- Image/Text Extraction ---
-Pillow
-
-# --- Vector Store ---
-faiss-cpu  # ✅ Use CPU version instead of faiss-gpu
+# --- File Handling ---
+PyMuPDF            # PDF
+python-docx        # DOCX
+python-multipart   # ZIP, File Uploads
+docx2txt           # Optional: extra text extraction from DOCX
+pandas             # CSV
+json5              # JSON with comments/flexibility
 
 # --- Utilities ---
+pydantic
 python-dotenv
 requests
-tiktoken
-aiofiles
-aiohttp
