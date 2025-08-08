@@ -13,28 +13,26 @@ sentence-transformers
 accelerate
 
 # --- Document Processing ---
-PyMuPDF                   # For PDFs
-docx2txt                  # For .docx
-python-pptx               # For .pptx
-pandas                    # For .csv and .json
-openpyxl                  # Optional: Excel files
-html2text                 # For .html
-beautifulsoup4            # Also for HTML parsing
-pypandoc                  # For .md, .rtf conversion
-python-magic              # To detect file MIME types
-unstructured              # General purpose loader
+PyMuPDF
+docx2txt
+python-pptx
+pandas
+openpyxl
+html2text
+beautifulsoup4
+pypandoc
+python-magic
+unstructured
 
-# --- Image Processing ---
-Pillow                    # For .png and .jpg
+# --- Image/Text Extraction ---
+Pillow
 
 # --- Vector Store ---
-faiss-gpu                 # GPU-optimized FAISS
+faiss-cpu  # ✅ Use CPU version instead of faiss-gpu
 
 # --- Utilities ---
-python-dotenv             # Load .env
-requests                  # HTTP requests
-tiktoken                 # Token counting for OpenAI models
-
-# --- Async + Parsing Support ---
-aiofiles                  # For file upload/download
-aiohttp                   # Optional: concurrent downloads
+python-dotenv
+requests
+tiktoken
+aiofiles
+aiohttp
