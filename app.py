@@ -15,6 +15,7 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
 import nltk
 from nltk.tokenize import sent_tokenize
@@ -123,7 +124,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         # Sentence-preserving splitting
         combined_text = "\n".join([doc.page_content for doc in docs])
         sentences = sent_tokenize(combined_text)
-        pseudo_docs = [{"page_content": s} for s in sentences if len(s.strip()) > 30]
+        pseudo_docs = [Document(page_content=s) for s in sentences if len(s.strip()) > 30]
         chunks = text_splitter.split_documents(pseudo_docs)
         print(f"📄 Chunks created: {len(chunks)}")
 
