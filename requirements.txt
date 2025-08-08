@@ -34,7 +34,7 @@ PyMuPDF
 
 # --- Vector Store (GPU Version) ---
 # For a CPU-only server, change this to 'faiss-cpu'
-faiss-gpu
+faiss-cpu
 
 # --- Essential Dependencies ---
 requests  # For making HTTP requests
