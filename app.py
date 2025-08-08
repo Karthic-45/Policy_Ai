@@ -66,9 +66,6 @@ except Exception as e:
     print(f"❌ Error initializing models: {e}")
 
 # Request models
-class QuestionRequest(BaseModel):
-    question: str
-
 class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -114,34 +111,40 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
         # Determine chunk size based on page count
         page_count = len(docs)
-        if page_count <= 5:
-            chunk_size = 600
-        elif page_count <= 10:
-            chunk_size = 800
-        else:
-            chunk_size = 1000
+        chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
 
-        # Optimized chunking
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=100,
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
-        print(f"📄 Chunks created (before limit): {len(chunks)}")
+        print(f"📄 Chunks created: {len(chunks)}")
 
-        # Cap chunk count
-        max_chunks = 300
-        if len(chunks) > max_chunks:
-            chunks = chunks[:max_chunks]
-        print(f"📄 Chunks used: {len(chunks)}")
-
-        # Temporary FAISS vector store
+        # Temporary FAISS vector store for filtering
         embeddings_model = OpenAIEmbeddings(model="text-embedding-ada-002")
         temp_vector_store = FAISS.from_documents(chunks, embeddings_model)
 
-        # Async answering
-        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions if q.strip()]
+        # Identify relevant chunks
+        used_chunk_content = set()
+        for question in data.questions:
+            results = temp_vector_store.similarity_search(question.strip(), k=12)
+            for doc in results:
+                used_chunk_content.add(doc.page_content)
+
+        filtered_chunks = [doc for doc in chunks if doc.page_content in used_chunk_content]
+
+        # Limit to max 300 chunks
+        max_chunks = 300
+        if len(filtered_chunks) > max_chunks:
+            filtered_chunks = filtered_chunks[:max_chunks]
+        print(f"📄 Filtered chunks used: {len(filtered_chunks)}")
+
+        # Final vector store
+        optimized_vector_store = FAISS.from_documents(filtered_chunks, embeddings_model)
+
+        # Answer questions asynchronously
+        tasks = [ask_async(qa_chain, optimized_vector_store, q.strip()) for q in data.questions if q.strip()]
         answers = await asyncio.gather(*tasks)
 
         total_time = time.time() - start_time
