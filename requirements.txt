@@ -5,23 +5,25 @@ uvicorn[standard]
 # --- Environment Variables ---
 python-dotenv
 
-# --- LangChain Ecosystem ---
+# --- LangChain Core ---
 langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-openai>=0.1.3
-langchain-community>=0.2.0
+langchain-core
+langchain-openai
+langchain-community
 
 # --- Embeddings and Vector DB ---
-openai>=1.11.0
+openai
 faiss-cpu
 
-# --- PDF Loading and NLP ---
-PyMuPDF  # For PDF parsing via langchain_community.document_loaders
-pydantic>=2.0
-nltk     # For advanced sentence-based splitting (used in custom chunking)
+# --- PDF Loading and Data Handling ---
+PyMuPDF
+pydantic
 
-# --- Token Counting (OpenAI models) ---
+# --- Token Counting ---
 tiktoken
 
-# --- Similarity Scoring ---
+# --- Cosine Similarity ---
 scikit-learn
+
+# --- NLTK for sentence chunking ---
+nltk
