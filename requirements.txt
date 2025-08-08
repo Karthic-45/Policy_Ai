@@ -1,33 +1,41 @@
+# --------------------------------------------------------------------------
+# INSTRUCTIONS
+# 1. IMPORTANT: First, install PyTorch with CUDA support. Go to the
+#    official PyTorch website (https://pytorch.org/get-started/locally/)
+#    and get the correct command for your system (OS, Package, CUDA Version).
+#    The command will look something like this:
+#    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# 2. After PyTorch is installed, install all other packages using this file:
+#    pip install -r requirements.txt
+# --------------------------------------------------------------------------
+
 # --- Core Backend Framework ---
-# For building and running the web server
 fastapi
 uvicorn[standard]
 
 # --- Configuration ---
-# For managing environment variables (e.g., API keys)
 python-dotenv
 
 # --- LangChain & AI Integrations ---
-# The core LangChain library and specific integration for OpenAI
+# Core library and specific integrations. This resolves the previous conflict.
 langchain>=0.2.0
 langchain-openai
+langchain-community
 
-# --- Data Handling & Validation ---
-# For parsing PDFs and validating data models
+# --- Local Embeddings ---
+# For running embedding models locally on your GPU
+InstructorEmbedding
+sentence-transformers
+accelerate # Helps optimize Hugging Face model loading
+
+# --- Document Processing ---
 PyMuPDF
-pydantic
 
-# --- Vector Store ---
-# For creating and searching through vector embeddings on the CPU
-# For a GPU server, replace this with 'faiss-gpu'
-faiss-cpu
+# --- Vector Store (GPU Version) ---
+# For a CPU-only server, change this to 'faiss-cpu'
+faiss-gpu
 
 # --- Essential Dependencies ---
-# Required for making HTTP requests (e.g., to download files)
-requests
-
-# For token counting with OpenAI models
-tiktoken
-
-# Required by many embedding models and underlying ML frameworks
-torch
+requests  # For making HTTP requests
+tiktoken  # Tokenizer for OpenAI models
