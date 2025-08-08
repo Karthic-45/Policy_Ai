@@ -24,3 +24,4 @@ tiktoken
 
 # --- Extra dependency for this setup ---
 requests
+torch
