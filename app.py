@@ -2,182 +2,211 @@ import os
 import tempfile
 import asyncio
 import requests
-import time
-import logging
-import zipfile
-from typing import List, Dict
-
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
-from langchain.chains import RetrievalQA
-from langchain_community.embeddings import HuggingFaceInstructEmbeddings
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI
-from langchain.document_loaders import PyMuPDFLoader, Docx2txtLoader, DirectoryLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema.retriever import BaseRetriever
-
-# -----------------------------
-# Configuration
-# -----------------------------
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# --- FastAPI App Setup ---
-app = FastAPI(
-    title="Unified HackRx Q&A API",
-    description="A complete solution for document Q&A with in-memory caching.",
-    version="6.0-unified"
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import PromptTemplate
+from langchain.document_loaders import (
+    PyMuPDFLoader, UnstructuredFileLoader, TextLoader,
+    UnstructuredEmailLoader, UnstructuredImageLoader
 )
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import zipfile
+import mimetypes
+import pandas as pd
 
-# --- Models & API Configuration ---
-HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "hkunlp/instructor-large")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
-DEVICE = os.getenv("DEVICE", "cuda") # "cuda" for GPU, "cpu" for CPU
+# Load environment variables
+load_dotenv()
 
-# -----------------------------
-# Global Objects & Cache
-# -----------------------------
+# Initialize FastAPI app
+app = FastAPI(
+    title="HackRx Insurance Q&A API",
+    description="Answer insurance-related questions using RAG and GPT",
+    version="1.0.0"
+)
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global models
+vector_store = None
+qa_chain = None
 try:
-    logger.info(f"Initializing models on device: {DEVICE}...")
-    # Models are loaded only once when the application starts
-    embeddings_model = HuggingFaceInstructEmbeddings(model_name=EMBEDDING_MODEL, model_kwargs={"device": DEVICE})
-    llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.1)
+    print("\U0001F50D Initializing models...")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    os.environ["OPENAI_API_KEY"] = openai_api_key
 
-    # In-memory cache to store generated retrievers for each document URL
-    retriever_cache: Dict[str, BaseRetriever] = {}
-    
-    logger.info("System ready.")
+    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
+    chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
+
+    embeddings = OpenAIEmbeddings(model=embedding_model_name)
+    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
+
+    prompt = PromptTemplate.from_template("""
+    You are an expert assistant in insurance policy analysis.
+    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
+    - Do not make assumptions.
+    - Quote directly from the policy when possible.
+
+    Context:
+    {context}
+
+    Question: {input}
+    Answer:
+    """)
+
+    qa_chain = create_stuff_documents_chain(llm, prompt)
+    print("✅ Models initialized.")
 except Exception as e:
-    logger.critical(f"Failed to initialize the system: {e}", exc_info=True)
-    exit()
+    print(f"❌ Error initializing models: {e}")
 
-# --- Pydantic Models ---
+# Request models
+class QuestionRequest(BaseModel):
+    question: str
+
 class HackRxRequest(BaseModel):
-    documents: str # URL of the document
+    documents: str
     questions: List[str]
 
-# -----------------------------
-# Core Processing Logic
-# -----------------------------
-async def create_and_cache_retriever(url: str) -> BaseRetriever:
-    """
-    Handles the entire 'cold start' process for a new document URL.
-    This function downloads, processes, and embeds a document, then caches the resulting retriever.
-    """
-    
-    def process_document_sync():
-        # This synchronous function contains all the blocking I/O and CPU/GPU-bound tasks.
-        tmp_path = None
-        try:
-            # 1. Download file
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                response = requests.get(url)
-                response.raise_for_status()
-                tmp.write(response.content)
-                tmp_path = tmp.name
-            
-            # 2. Load document based on file type
-            docs = []
-            if url.lower().endswith(".pdf"):
-                loader = PyMuPDFLoader(tmp_path)
-                docs = loader.load()
-            elif url.lower().endswith(".docx"):
-                loader = Docx2txtLoader(tmp_path)
-                docs = loader.load()
-            elif url.lower().endswith(".zip"):
-                with tempfile.TemporaryDirectory() as extract_dir:
-                    with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
-                        zip_ref.extractall(extract_dir)
-                    dir_loader = DirectoryLoader(extract_dir, glob="**/*", use_multithreading=True, loader_map={".pdf": PyMuPDFLoader, ".docx": Docx2txtLoader})
-                    docs = dir_loader.load()
-            else:
-                raise ValueError("Unsupported file type.")
-
-            docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
-            if not docs:
-                raise ValueError("Document is empty or contains no processable files.")
-            
-            # 3. Split documents into chunks
-            page_count = len(docs)
-            chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
-            splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=150)
-            chunks = splitter.split_documents(docs)
-            
-            # 4. Create FAISS vector store (computationally intensive)
-            logger.info(f"Creating FAISS index for {url}. This will take several minutes...")
-            vector_store = FAISS.from_documents(chunks, embeddings_model)
-            
-            # 5. Create and return the retriever
-            return vector_store.as_retriever(search_kwargs={"k": 5})
-
-        finally:
-            # Cleanup the temporary file
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-    # Run the blocking function in a separate thread to not freeze the API
-    retriever = await asyncio.to_thread(process_document_sync)
-    
-    # Cache the newly created retriever for future requests
-    retriever_cache[url] = retriever
-    logger.info(f"Retriever for {url} successfully created and cached.")
-    return retriever
-
-# -----------------------------
-# API Endpoints
-# -----------------------------
+# Health check route
 @app.get("/")
 def health():
-    return {"status": "up", "device": DEVICE, "cached_documents": list(retriever_cache.keys())}
+    return {"status": "API is running"}
+
+@app.post("/ask")
+def ask_question(request: QuestionRequest):
+    if not vector_store or not qa_chain:
+        raise HTTPException(status_code=500, detail="Model not loaded.")
+
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    relevant_chunks = vector_store.similarity_search(question, k=12)
+    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
+
+    return {
+        "question": question,
+        "answer": response,
+        "source_chunks": [doc.page_content for doc in relevant_chunks]
+    }
+
+# Universal document loader
+from langchain.schema import Document
+
+def load_documents(file_path: str) -> List[Document]:
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".pdf":
+        return PyMuPDFLoader(file_path).load()
+    elif ext in [".doc", ".docx", ".pptx", ".html", ".htm"]:
+        return UnstructuredFileLoader(file_path).load()
+    elif ext in [".txt", ".md"]:
+        return TextLoader(file_path).load()
+    elif ext == ".eml":
+        return UnstructuredEmailLoader(file_path).load()
+    elif ext in [".png", ".jpg", ".jpeg"]:
+        return UnstructuredImageLoader(file_path).load()
+    elif ext == ".csv":
+        df = pd.read_csv(file_path)
+        return [Document(page_content=df.to_string())]
+    elif ext == ".zip":
+        docs = []
+        with tempfile.TemporaryDirectory() as extract_dir:
+            with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+                for root, _, files in os.walk(extract_dir):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        try:
+                            docs.extend(load_documents(full_path))
+                        except Exception as e:
+                            print(f"⚠ Skipped file in ZIP: {file} ({e})")
+        return docs
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}")
+
+# Async task handler
+async def ask_async(llm_chain, vector_store, question):
+    rel_chunks = vector_store.similarity_search(question, k=12)
+    raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
+    answer = raw.strip()
+    if not answer or "i don't know" in answer.lower():
+        return "The policy document does not specify this clearly."
+    return answer
 
 @app.post("/hackrx/run")
-async def hackrx_run(data: HackRxRequest, authorization: str = Header(None)):
-    if not HACKRX_BEARER_TOKEN or (not authorization or f"Bearer {HACKRX_BEARER_TOKEN}" != authorization.replace("Bearer ", "")):
-        raise HTTPException(status_code=403, detail="Invalid or missing token.")
-    
-    doc_url = data.documents
-    start_time = time.time()
-    
+async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
+    expected_token = os.getenv("HACKRX_BEARER_TOKEN")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = authorization.split("Bearer ")[1]
+    if token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid token.")
+
     try:
-        # Check if the retriever for this URL is already in the cache
-        if doc_url in retriever_cache:
-            # Fast Path: Use the cached retriever
-            logger.info(f"Cache HIT for URL: {doc_url}")
-            retriever = retriever_cache[doc_url]
-        else:
-            # Slow Path: Process and cache the new document
-            logger.info(f"Cache MISS for URL: {doc_url}. Starting processing...")
-            retriever = await create_and_cache_retriever(doc_url)
-        
-        # Create the QA chain using the obtained retriever
-        qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
-        
-        # Process all questions
-        answers = []
-        for question in data.questions:
-            if not question.strip():
-                continue
-            
-            result = qa_chain.invoke({"query": question})
-            answer = result.get('result', "No answer found.").strip()
-            
-            if "don't know" in answer.lower():
-                answers.append("The policy document does not seem to contain information about this.")
-            else:
-                answers.append(answer)
+        import time
+        start_time = time.time()
 
-        duration = round(time.time() - start_time, 2)
-        logger.info(f"Request for {doc_url} completed in {duration} seconds.")
+        # Download file
+        response = requests.get(data.documents)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to download document.")
 
-        return {"status": "success", "answers": answers}
+        # Guess extension
+        mime_type = response.headers.get("content-type", "")
+        extension = mimetypes.guess_extension(mime_type) or ".bin"
 
+        with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tmp:
+            tmp.write(response.content)
+            tmp_path = tmp.name
+
+        # Load documents
+        docs = load_documents(tmp_path)
+        docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
+
+        if not docs:
+            raise HTTPException(status_code=400, detail="No valid content found in document.")
+
+        # Chunking
+        page_count = len(docs)
+        chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ".", " "]
+        )
+        chunks = splitter.split_documents(docs)
+        chunks = chunks[:300]
+
+        # FAISS
+        temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
+
+        # Q&A
+        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
+        answers = await asyncio.gather(*tasks)
+
+        total_time = time.time() - start_time
+        print(f"⏱ Total Time: {total_time:.2f} sec")
+
+        return {
+            "status": "success",
+            "answers": answers
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        logger.error(f"An error occurred while processing request for {doc_url}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
