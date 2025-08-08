@@ -1,26 +1,30 @@
 import os
-import hashlib
 import tempfile
+import asyncio
 import requests
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import fitz  # PyMuPDF
-
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
 from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import PromptTemplate
+from langchain.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
-app = FastAPI()
+# Initialize FastAPI app
+app = FastAPI(
+    title="HackRx Insurance Q&A API",
+    description="Answer insurance-related questions using RAG and GPT",
+    version="1.0.0"
+)
+
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,116 +33,129 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request schema
-class InputData(BaseModel):
-    documents: str  # PDF URL
+# Global models
+vector_store = None
+qa_chain = None
+try:
+    print("🔍 Initializing models...")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    os.environ["OPENAI_API_KEY"] = openai_api_key
+
+    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
+    chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
+
+    embeddings = OpenAIEmbeddings(model=embedding_model_name)
+    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
+
+    prompt = PromptTemplate.from_template("""
+    You are an expert assistant in insurance policy analysis.
+    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
+    - Do not make assumptions.
+    - Quote directly from the policy when possible.
+
+    Context:
+    {context}
+
+    Question: {input}
+    Answer:
+    """)
+
+    qa_chain = create_stuff_documents_chain(llm, prompt)
+    print("✅ Models initialized.")
+except Exception as e:
+    print(f"❌ Error initializing models: {e}")
+
+# Request models
+class QuestionRequest(BaseModel):
+    question: str
+
+class HackRxRequest(BaseModel):
+    documents: str
     questions: List[str]
 
-# Constants
-MAX_PAGES = 1500
-BATCH_SIZE = 100
+# Health check route
+@app.get("/")
+def health():
+    return {"status": "API is running"}
 
-# Model setup
-llm = ChatOpenAI(model="gpt-4", temperature=0)
-embeddings_model = OpenAIEmbeddings()
-splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
+# Local testing endpoint
+@app.post("/ask")
+def ask_question(request: QuestionRequest):
+    if not vector_store or not qa_chain:
+        raise HTTPException(status_code=500, detail="Model not loaded.")
 
-prompt_template = PromptTemplate.from_template("""
-You are an expert assistant in the insurance domain. Answer the question strictly based on the provided context.
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-<context>
-{context}
-</context>
+    relevant_chunks = vector_store.similarity_search(question, k=12)
+    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
 
-Question: {input}
-Answer:
-""")
+    return {
+        "question": question,
+        "answer": response,
+        "source_chunks": [doc.page_content for doc in relevant_chunks]
+    }
 
-chain = create_stuff_documents_chain(llm, prompt_template)
+# Async task handler
+async def ask_async(llm_chain, vector_store, question):
+    rel_chunks = vector_store.similarity_search(question, k=12)
+    raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
+    answer = raw.strip()
+    if not answer or "i don't know" in answer.lower():
+        return "The policy document does not specify this clearly."
+    return answer
 
-os.makedirs("./faiss_indexes", exist_ok=True)
-
-def get_sha256(filepath):
-    """Compute a unique hash for a given file."""
-    h = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def stream_pdf_chunks(file_path, splitter, max_pages=MAX_PAGES, dedupe_set=None):
-    """Yield chunks from PDF pages with deduplication and page limit."""
-    dedupe_set = dedupe_set or set()
-    with fitz.open(file_path) as pdf:
-        page_count = min(pdf.page_count, max_pages)
-        for i in range(page_count):
-            try:
-                page_text = pdf.load_page(i).get_text()
-            except Exception:
-                continue  # skip unreadable page
-            clean_text = page_text.strip()
-            if clean_text and clean_text not in dedupe_set:
-                dedupe_set.add(clean_text)
-                doc = Document(page_content=clean_text, metadata={"page": i})
-                for chunk in splitter.split_documents([doc]):
-                    if chunk.page_content.strip():
-                        yield chunk
-
+# HackRx Evaluation Endpoint
 @app.post("/hackrx/run")
-async def run_hackrx(data: InputData, authorization: Optional[str] = Header(None)):
-    # Auth check
-    if not authorization or authorization != f"Bearer {os.getenv('API_KEY')}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # Download the PDF
-    try:
-        response = requests.get(data.documents, timeout=300, stream=True)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Invalid document URL: {e}")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                tmp.write(chunk)
-        tmp_path = tmp.name
+async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
+    expected_token = os.getenv("HACKRX_BEARER_TOKEN")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = authorization.split("Bearer ")[1]
+    if token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid token.")
 
     try:
-        doc_hash = get_sha256(tmp_path)
-        faiss_path = f"./faiss_indexes/{doc_hash}"
+        import time
+        start_time = time.time()
 
-        if os.path.exists(faiss_path):
-            vector = FAISS.load_local(
-                faiss_path,
-                embeddings_model,
-                allow_dangerous_deserialization=True
-            )
-        else:
-            vector = FAISS(embedding_function=embeddings_model)
-            batch = []
-            seen = set()
-            for chunk in stream_pdf_chunks(tmp_path, splitter, dedupe_set=seen):
-                batch.append(chunk)
-                if len(batch) >= BATCH_SIZE:
-                    vector.add_documents(batch)
-                    batch = []
-            if batch:
-                vector.add_documents(batch)
-            vector.save_local(faiss_path)
+        # Download and save PDF
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            response = requests.get(data.documents)
+            tmp.write(response.content)
+            tmp_path = tmp.name
 
-        # Answering questions
-        answers = []
-        for question in data.questions:
-            docs = vector.similarity_search(question, k=8)
-            context = "\n\n".join([doc.page_content for doc in docs])
-            response = chain.invoke({"input": question, "context": context})
-            answers.append(response.strip())
+        # Load and filter document
+        loader = PyMuPDFLoader(tmp_path)
+        docs = loader.load()
+        docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
+
+        # Uniform chunking strategy for large documents
+        chunk_size = 1000
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ".", " "]
+        )
+        chunks = splitter.split_documents(docs)
+        print(f"📄 Chunks created: {len(chunks)}")
+
+        # No chunk cap — process all
+        embeddings_model = OpenAIEmbeddings(model="text-embedding-ada-002")
+        temp_vector_store = FAISS.from_documents(chunks, embeddings_model)
+
+        # Async answering
+        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
+        answers = await asyncio.gather(*tasks)
+
+        total_time = time.time() - start_time
+        print(f"⏱️ Total Time: {total_time:.2f} sec")
 
         return {
-            "status": "completed",
+            "status": "success",
             "answers": answers
         }
 
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
