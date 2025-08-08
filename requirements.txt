@@ -1,30 +1,33 @@
-# --- Find CPU-only packages from this special index ---
---index-url https://download.pytorch.org/whl/cpu
-
 # --- Core Backend Framework ---
 fastapi
 uvicorn[standard]
 
-# --- Configuration ---
-python-dotenv
-
 # --- LangChain & AI Integrations ---
+# The core framework and integrations with OpenAI and Community models/loaders
 langchain>=0.2.0
-langchain-openai
 langchain-community
+langchain-openai
 
-# --- Local Embeddings & ML ---
-torch # This will now be a small CPU version
+# --- Local Embeddings & Model Handling ---
+# PyTorch and sentence-transformers are the foundation for HuggingFace embeddings
+torch
 sentence-transformers
-InstructorEmbedding
+# Accelerate helps optimize model loading, especially from Hugging Face
 accelerate
 
 # --- Document Processing ---
+# PyMuPDF is for PDF files, docx2txt is for .docx files
 PyMuPDF
+docx2txt
 
-# --- Vector Store (CPU Version) ---
-faiss-cpu
+# --- Vector Store ---
+# GPU-optimized version of Facebook's similarity search library
+faiss-gpu
 
-# --- Essential Dependencies ---
+# --- Utilities ---
+# For handling environment variables
+python-dotenv
+# For making HTTP requests to download documents
 requests
+# For token counting with OpenAI models
 tiktoken
