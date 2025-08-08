@@ -2,32 +2,39 @@
 fastapi
 uvicorn[standard]
 
-# --- LangChain & AI Integrations ---
-# The core framework and integrations with OpenAI and Community models/loaders
+# --- LangChain & OpenAI Integration ---
 langchain>=0.2.0
 langchain-community
 langchain-openai
 
-# --- Local Embeddings & Model Handling ---
-# PyTorch and sentence-transformers are the foundation for HuggingFace embeddings
+# --- Embeddings & Model Handling ---
 torch
 sentence-transformers
-# Accelerate helps optimize model loading, especially from Hugging Face
 accelerate
 
 # --- Document Processing ---
-# PyMuPDF is for PDF files, docx2txt is for .docx files
-PyMuPDF
-docx2txt
+PyMuPDF                   # For PDFs
+docx2txt                  # For .docx
+python-pptx               # For .pptx
+pandas                    # For .csv and .json
+openpyxl                  # Optional: Excel files
+html2text                 # For .html
+beautifulsoup4            # Also for HTML parsing
+pypandoc                  # For .md, .rtf conversion
+python-magic              # To detect file MIME types
+unstructured              # General purpose loader
+
+# --- Image Processing ---
+Pillow                    # For .png and .jpg
 
 # --- Vector Store ---
-# GPU-optimized version of Facebook's similarity search library
-faiss-gpu
+faiss-gpu                 # GPU-optimized FAISS
 
 # --- Utilities ---
-# For handling environment variables
-python-dotenv
-# For making HTTP requests to download documents
-requests
-# For token counting with OpenAI models
-tiktoken
+python-dotenv             # Load .env
+requests                  # HTTP requests
+tiktoken                 # Token counting for OpenAI models
+
+# --- Async + Parsing Support ---
+aiofiles                  # For file upload/download
+aiohttp                   # Optional: concurrent downloads
