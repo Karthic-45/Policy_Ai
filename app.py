@@ -65,7 +65,7 @@ try:
 except Exception as e:
     print(f"❌ Error initializing models: {e}")
 
-# Request models
+# Pydantic request model
 class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -75,7 +75,7 @@ class HackRxRequest(BaseModel):
 def health():
     return {"status": "API is running"}
 
-# Async task handler
+# Async handler for each question
 async def ask_async(llm_chain, vector_store, question):
     rel_chunks = vector_store.similarity_search(question, k=12)
     raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
@@ -84,7 +84,7 @@ async def ask_async(llm_chain, vector_store, question):
         return "The policy document does not specify this clearly."
     return answer
 
-# HackRx Evaluation Endpoint
+# HackRx evaluation endpoint
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
@@ -98,7 +98,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         import time
         start_time = time.time()
 
-        # Download and save PDF
+        # Save PDF temporarily
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             response = requests.get(data.documents)
             tmp.write(response.content)
@@ -109,7 +109,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         docs = loader.load()
         docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
 
-        # Determine chunk size based on page count
+        # Dynamic chunk size based on page count
         page_count = len(docs)
         chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
 
@@ -121,11 +121,11 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         chunks = splitter.split_documents(docs)
         print(f"📄 Chunks created: {len(chunks)}")
 
-        # Temporary FAISS vector store for filtering
+        # Build temporary vector store
         embeddings_model = OpenAIEmbeddings(model="text-embedding-ada-002")
         temp_vector_store = FAISS.from_documents(chunks, embeddings_model)
 
-        # Identify relevant chunks
+        # Keep only used chunks
         used_chunk_content = set()
         for question in data.questions:
             results = temp_vector_store.similarity_search(question.strip(), k=12)
@@ -134,16 +134,17 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
         filtered_chunks = [doc for doc in chunks if doc.page_content in used_chunk_content]
 
-        # Limit to max 300 chunks
+        # Cap filtered chunks to 300 for efficiency
         max_chunks = 300
         if len(filtered_chunks) > max_chunks:
             filtered_chunks = filtered_chunks[:max_chunks]
+
         print(f"📄 Filtered chunks used: {len(filtered_chunks)}")
 
-        # Final vector store
+        # Create final optimized vector store
         optimized_vector_store = FAISS.from_documents(filtered_chunks, embeddings_model)
 
-        # Answer questions asynchronously
+        # Process all valid questions asynchronously
         tasks = [ask_async(qa_chain, optimized_vector_store, q.strip()) for q in data.questions if q.strip()]
         answers = await asyncio.gather(*tasks)
 
