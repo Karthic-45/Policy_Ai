@@ -7,9 +7,7 @@ faiss-cpu
 pydantic
 requests
 PyMuPDF
-unstructured
-unstructured_email_extractor
-unstructured_image_loader
+unstructured[local-inference]
 pandas
 filetype
 python-magic
