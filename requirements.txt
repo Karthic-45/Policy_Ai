@@ -3,7 +3,7 @@ uvicorn[standard]==0.22.0
 python-dotenv==1.0.0
 requests==2.31.0
 langchain==0.0.263
-langchain-openai==0.0.26
+langchain-openai==0.3.29
 langchain-community==0.0.33
 pydantic==1.10.12
 pandas==2.0.3
