@@ -34,10 +34,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request model
+# Request model for your given JSON format
 class QueryRequest(BaseModel):
-    blob_urls: List[str]
-    question: str
+    documents: str
+    questions: List[str]
 
 # Loader function
 def load_documents(file_path: str) -> List[Document]:
@@ -94,18 +94,14 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
     if authorization != f"Bearer {os.getenv('API_KEY')}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    all_docs = []
-    for blob_url in request.blob_urls:
-        file_path = await download_file(blob_url)
-        docs = load_documents(file_path)
-        all_docs.extend(docs)
+    # Download & load the single document
+    file_path = await download_file(request.documents)
+    all_docs = load_documents(file_path)
 
-    # Vector store with FAISS
+    # Create FAISS vector store
     embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
     vectorstore = FAISS.from_documents(all_docs, embeddings)
-
     retriever = vectorstore.as_retriever()
-    retrieved_docs = retriever.get_relevant_documents(request.question)
 
     # LLM
     llm = ChatOpenAI(model="gpt-4", temperature=0)
@@ -114,5 +110,11 @@ async def run_query(request: QueryRequest, authorization: str = Header(None)):
     )
     chain = create_stuff_documents_chain(llm, prompt)
 
-    answer = chain.run({"context": retrieved_docs, "question": request.question})
-    return {"status": "success", "answer": answer}
+    # Loop through each question
+    results = []
+    for q in request.questions:
+        retrieved_docs = retriever.get_relevant_documents(q)
+        answer = chain.run({"context": retrieved_docs, "question": q})
+        results.append({"question": q, "answer": answer})
+
+    return {"status": "success", "results": results}
