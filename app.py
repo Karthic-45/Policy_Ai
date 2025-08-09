@@ -26,18 +26,21 @@ from langchain.document_loaders import (
 from PIL import Image
 import rarfile
 import py7zr
+import logging
 
-# Load environment variables
+# ---------------- Logging Config ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ---------------- Load Environment ----------------
 load_dotenv()
 
-# Initialize FastAPI app
+# ---------------- Initialize FastAPI ----------------
 app = FastAPI(
     title="HackRx Insurance Q&A API",
     description="Answer insurance-related questions using RAG and GPT",
     version="1.0.0"
 )
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,13 +49,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables
+# ---------------- Globals ----------------
 vector_store = None
 qa_chain = None
 
-# Model initialization
+# ---------------- Question Classification ----------------
+def classify_question(question: str) -> str:
+    """Simple rule-based classification of insurance questions."""
+    q_lower = question.lower()
+    if "exclusion" in q_lower:
+        return "Policy Exclusion"
+    elif "renewal" in q_lower:
+        return "Policy Renewal"
+    elif "pre-existing" in q_lower or "ped" in q_lower:
+        return "Pre-Existing Condition"
+    elif "claim" in q_lower:
+        return "Claims Process"
+    elif "co-payment" in q_lower or "copay" in q_lower:
+        return "Payment Condition"
+    elif "coverage" in q_lower or "covered" in q_lower:
+        return "Coverage Details"
+    else:
+        return "General"
+
+# ---------------- Model Initialization ----------------
 try:
-    print("🔍 Initializing models...")
+    logging.info("🔍 Initializing models...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
         raise ValueError("OPENAI_API_KEY not set in environment variables.")
@@ -69,20 +91,18 @@ try:
     Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
     - Do not make assumptions.
     - Quote directly from the policy when possible.
-
     Context:
     {context}
-
     Question: {input}
     Answer:
     """)
 
     qa_chain = create_stuff_documents_chain(llm, prompt)
-    print("✅ Models initialized successfully.")
+    logging.info("✅ Models initialized successfully.")
 except Exception as e:
-    print(f"❌ Error initializing models: {e}")
+    logging.error(f"❌ Error initializing models: {e}")
 
-# Request models
+# ---------------- Request Models ----------------
 class QuestionRequest(BaseModel):
     question: str
 
@@ -90,12 +110,12 @@ class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# Health check
+# ---------------- Health Check ----------------
 @app.get("/")
 def health():
     return {"status": "API is running"}
 
-# Question answering route
+# ---------------- Ask Question Endpoint ----------------
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
     if not vector_store or not qa_chain:
@@ -105,16 +125,21 @@ def ask_question(request: QuestionRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
+    q_type = classify_question(question)
+    logging.info(f"📝 User Question: {question}")
+    logging.info(f"📌 Question Type: {q_type}")
+
     relevant_chunks = vector_store.similarity_search(question, k=12)
     response = qa_chain.invoke({"context": relevant_chunks, "input": question})
 
     return {
         "question": question,
+        "question_type": q_type,
         "answer": response,
         "source_chunks": [doc.page_content for doc in relevant_chunks]
     }
 
-# Document loader
+# ---------------- Document Loader ----------------
 def load_documents(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
 
@@ -162,7 +187,7 @@ def load_documents(file_path: str) -> List[Document]:
     except Exception as e:
         raise ValueError(f"Could not read file: {file_path} ({e})")
 
-# Helper: extract and load archives
+# ---------------- Archive Extraction Helper ----------------
 def extract_and_load(file_path, archive_class):
     docs = []
     with tempfile.TemporaryDirectory() as extract_dir:
@@ -174,11 +199,15 @@ def extract_and_load(file_path, archive_class):
                     try:
                         docs.extend(load_documents(full_path))
                     except Exception as e:
-                        print(f"⚠ Skipped file in archive: {file} ({e})")
+                        logging.warning(f"⚠ Skipped file in archive: {file} ({e})")
     return docs
 
-# Async question answering
+# ---------------- Async Answer ----------------
 async def ask_async(llm_chain, vector_store, question):
+    q_type = classify_question(question)
+    logging.info(f"📝 Async Question: {question}")
+    logging.info(f"📌 Question Type: {q_type}")
+
     rel_chunks = vector_store.similarity_search(question, k=12)
     raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
     answer = raw.strip()
@@ -186,7 +215,7 @@ async def ask_async(llm_chain, vector_store, question):
         return "The policy document does not specify this clearly."
     return answer
 
-# Main HackRx API route
+# ---------------- HackRx Main Endpoint ----------------
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
@@ -200,7 +229,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         import time
         start_time = time.time()
 
-        print(f"📄 Downloading document from: {data.documents}")
+        logging.info(f"📄 Downloading document from: {data.documents}")
         response = requests.get(data.documents)
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to download document.")
@@ -235,9 +264,12 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         answers = await asyncio.gather(*tasks)
 
         total_time = time.time() - start_time
-        print(f"✅ Processed in {total_time:.2f} seconds.")
+        logging.info(f"✅ Processed in {total_time:.2f} seconds.")
 
-        return {"status": "success", "answers": answers}
+        return {
+            "status": "success",
+            "answers": answers
+        }
 
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
