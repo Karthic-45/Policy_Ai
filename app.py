@@ -28,6 +28,11 @@ import rarfile
 import py7zr
 import logging
 
+# Optional: prevent FAISS GPU warning on Railway
+import faiss
+if not hasattr(faiss, "GpuIndexIVFFlat"):
+    logging.warning("⚠ FAISS GPU not available. Using CPU-only FAISS.")
+
 # ---------------- Logging Config ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
