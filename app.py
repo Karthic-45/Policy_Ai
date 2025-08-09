@@ -11,15 +11,15 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
-from langchain.schema import Document
-from langchain.document_loaders import PyMuPDFLoader, TextLoader
+from langchain.document_loaders import (
+    PyMuPDFLoader, UnstructuredFileLoader, TextLoader,
+    UnstructuredEmailLoader, UnstructuredImageLoader
+)
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import zipfile
 import mimetypes
 import pandas as pd
-import docx
-import pptx
-import magic
+from langchain.schema import Document
 
 # Load environment variables
 load_dotenv()
@@ -103,68 +103,55 @@ def ask_question(request: QuestionRequest):
         "source_chunks": [doc.page_content for doc in relevant_chunks]
     }
 
-# Universal document loader
+# Universal document loader with fallback
 def load_documents(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
 
     try:
         if ext == ".pdf":
             return PyMuPDFLoader(file_path).load()
-
-        elif ext == ".docx":
-            doc = docx.Document(file_path)
-            text = "\n".join(p.text for p in doc.paragraphs)
-            return [Document(page_content=text)]
-
-        elif ext == ".pptx":
-            prs = pptx.Presentation(file_path)
-            text_runs = []
-            for slide in prs.slides:
-                for shape in slide.shapes:
-                    if hasattr(shape, "text"):
-                        text_runs.append(shape.text)
-            return [Document(page_content="\n".join(text_runs))]
-
+        elif ext in [".doc", ".docx", ".pptx", ".html", ".htm"]:
+            return UnstructuredFileLoader(file_path).load()
         elif ext in [".txt", ".md"]:
             return TextLoader(file_path).load()
-
+        elif ext == ".eml":
+            return UnstructuredEmailLoader(file_path).load()
+        elif ext in [".png", ".jpg", ".jpeg"]:
+            return UnstructuredImageLoader(file_path).load()
         elif ext == ".csv":
-            df = pd.read_csv(file_path, dtype=str, encoding_errors="ignore")
+            df = pd.read_csv(file_path)
             return [Document(page_content=df.to_string())]
-
-        elif ext == ".xlsx":
-            df = pd.read_excel(file_path, dtype=str)
-            return [Document(page_content=df.to_string())]
-
         elif ext == ".zip":
             docs = []
             with tempfile.TemporaryDirectory() as extract_dir:
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
                     zip_ref.extractall(extract_dir)
-                for root, _, files in os.walk(extract_dir):
-                    for f in files:
-                        docs.extend(load_documents(os.path.join(root, f)))
+                    for root, _, files in os.walk(extract_dir):
+                        for file in files:
+                            full_path = os.path.join(root, file)
+                            try:
+                                docs.extend(load_documents(full_path))
+                            except Exception as e:
+                                print(f"⚠ Skipped file in ZIP: {file} ({e})")
             return docs
-
         else:
-            mime_type = magic.from_file(file_path, mime=True)
+            # Fallback for .bin or unknown formats
+            with open(file_path, "rb") as f:
+                raw_data = f.read()
 
-            if mime_type.startswith("text/"):
-                with open(file_path, "r", errors="ignore") as f:
-                    return [Document(page_content=f.read())]
+            try:
+                decoded = raw_data.decode("utf-8")
+            except UnicodeDecodeError:
+                decoded = raw_data.decode("latin-1", errors="ignore")
 
-            elif mime_type.startswith("image/"):
-                return [Document(page_content=f"[Image file: {os.path.basename(file_path)}]")]
-
-            elif mime_type in ["application/octet-stream"]:
-                return [Document(page_content=f"[Binary file: {os.path.basename(file_path)}]")]
-
+            printable_ratio = sum(c.isprintable() or c.isspace() for c in decoded) / max(1, len(decoded))
+            if printable_ratio > 0.7:
+                return [Document(page_content=decoded)]
             else:
-                return [Document(page_content=f"[Unsupported file type: {mime_type}]")]
-
+                hex_preview = raw_data[:512].hex()
+                return [Document(page_content=f"[BINARY FILE PREVIEW - first 512 bytes in hex]: {hex_preview}")]
     except Exception as e:
-        print(f"⚠ Error loading {file_path}: {e}")
-        return []
+        raise ValueError(f"Could not read file: {file_path} ({e})")
 
 # Async task handler
 async def ask_async(llm_chain, vector_store, question):
@@ -203,7 +190,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
         # Load documents
         docs = load_documents(tmp_path)
-        docs = [doc for doc in docs if len(doc.page_content.strip()) > 50]
+        docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
 
         if not docs:
             raise HTTPException(status_code=400, detail="No valid content found in document.")
