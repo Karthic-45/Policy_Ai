@@ -11,6 +11,18 @@ from typing import List, Optional, Iterable
 from langdetect import detect
 from bs4 import BeautifulSoup
 
+# ---------------- Force FAISS to CPU-only before importing ----------------
+os.environ["FAISS_NO_GPU"] = "1"            # Don't try GPU
+os.environ["FAISS_DISABLE_AVX512"] = "1"    # Disable AVX512 entirely
+os.environ["FAISS_DISABLE_AVX512_SPR"] = "1"  # Disable SPR AVX512
+
+import faiss
+try:
+    faiss.omp_set_num_threads(1)
+    logging.info("✅ FAISS forced to CPU-only mode with AVX512 fully disabled.")
+except Exception as e:
+    logging.warning("⚠️ FAISS CPU initialization warning: %s", e)
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,17 +51,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# Force FAISS to CPU mode only & disable AVX512 SPR to avoid module errors
-os.environ["FAISS_NO_GPU"] = "1"
-os.environ["FAISS_DISABLE_AVX512_SPR"] = "1"
-
-import faiss
-try:
-    faiss.omp_set_num_threads(1)
-    logger.info("✅ FAISS initialized in CPU-only mode without AVX512-Spring or GPU.")
-except Exception as e:
-    logger.warning("⚠️ FAISS CPU initialization warning: %s", e)
 
 # Load environment variables
 load_dotenv()
