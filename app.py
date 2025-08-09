@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import asyncio
 import requests
@@ -45,7 +46,7 @@ load_dotenv()
 app = FastAPI(
     title="HackRx Insurance Q&A API",
     description="Answer insurance-related questions using RAG and GPT",
-    version="1.0.1"
+    version="1.0.2"
 )
 
 # Enable CORS
@@ -258,6 +259,135 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         return "The policy document does not specify this clearly."
     return answer
 
+# ---------------- Puzzle parsing helpers ----------------
+# Known landmarks (from the mission brief)
+KNOWN_LANDMARKS = [
+    "Gateway of India","India Gate","Charminar","Marina Beach","Howrah Bridge","Golconda Fort","Qutub Minar",
+    "Taj Mahal","Meenakshi Temple","Lotus Temple","Mysore Palace","Rock Garden","Victoria Memorial","Vidhana Soudha",
+    "Sun Temple","Golden Temple","Eiffel Tower","Statue of Liberty","Big Ben","Colosseum","Sydney Opera House",
+    "Christ the Redeemer","Burj Khalifa","CN Tower","Petronas Towers","Leaning Tower of Pisa","Mount Fuji",
+    "Niagara Falls","Louvre Museum","Stonehenge","Sagrada Familia","Acropolis","Machu Picchu","Moai Statues",
+    "Christchurch Cathedral","The Shard","Blue Mosque","Neuschwanstein Castle","Buckingham Palace",
+    "Space Needle","Times Square"
+]
+
+def extract_city_landmark_mapping_from_pdf(pdf_path: str, max_pages_to_scan: int = 50) -> dict:
+    """
+    Return a dict mapping city (str) -> landmark (str), extracted from the PDF text.
+    Scans up to max_pages_to_scan first pages (or all if smaller).
+    """
+    mapping = {}
+    try:
+        with fitz.open(pdf_path) as pdf:
+            page_count = pdf.page_count
+            scan = min(page_count, max_pages_to_scan)
+            raw_lines = []
+            for p in range(scan):
+                txt = pdf.load_page(p).get_text("text") or ""
+                # split lines and store
+                for l in txt.splitlines():
+                    ln = l.strip()
+                    if ln:
+                        # remove control characters but keep ASCII content
+                        raw_lines.append(ln)
+    except Exception as e:
+        logger.warning("Could not read PDF for puzzle mapping: %s", e)
+        return {}
+
+    # Try to find occurrences of known landmarks in lines and record the city following the landmark
+    for line in raw_lines:
+        # remove emojis and non-ascii noise for parsing
+        ascii_line = re.sub(r'[^\x00-\x7F]+', ' ', line).strip()
+        if not ascii_line:
+            continue
+        for lm in KNOWN_LANDMARKS:
+            if lm.lower() in ascii_line.lower():
+                # get substring after landmark (first occurrence)
+                idx = ascii_line.lower().find(lm.lower())
+                after = ascii_line[idx + len(lm):].strip()
+                # remove common separators
+                after = re.sub(r'^[\-\:\—\–\|,\s]+', '', after)
+                # remove trailing punctuation
+                after = re.sub(r'[\.,;:\)]*$', '', after).strip()
+                # if after is empty, maybe city is before the landmark or on same line in other format; try token approach
+                city_candidate = after
+                if not city_candidate:
+                    # token-based: get tokens and try tokens after the landmark token sequence
+                    tokens = ascii_line.split()
+                    lm_tokens = lm.split()
+                    for i in range(len(tokens) - len(lm_tokens) + 1):
+                        if [t.lower() for t in tokens[i:i+len(lm_tokens)]] == [tt.lower() for tt in lm_tokens]:
+                            city_tokens = tokens[i+len(lm_tokens):]
+                            if city_tokens:
+                                city_candidate = " ".join(city_tokens)
+                                break
+                # final clean
+                city_candidate = re.sub(r'[^A-Za-z0-9\s]', '', city_candidate).strip()
+                if city_candidate:
+                    # store city -> landmark, case-normalize city (strip extra whitespace)
+                    mapping[city_candidate] = lm
+                break
+    # If mapping empty, also attempt pattern matching like "Landmark Current Location" style
+    if not mapping:
+        # try to find lines that look like "<landmark>    <city>" (two or more spaces delim)
+        for line in raw_lines:
+            cleaned = re.sub(r'[^\x00-\x7F]+', ' ', line)
+            parts = re.split(r'\s{2,}', cleaned)
+            if len(parts) >= 2:
+                left, right = parts[0].strip(), parts[1].strip()
+                for lm in KNOWN_LANDMARKS:
+                    if lm.lower() in left.lower():
+                        city = re.sub(r'[^A-Za-z0-9\s]', '', right).strip()
+                        if city:
+                            mapping[city] = lm
+    return mapping
+
+def fetch_favorite_city_from_api(timeout: int = 10) -> Optional[str]:
+    url = "https://register.hackrx.in/submissions/myFavouriteCity"
+    try:
+        r = requests.get(url, timeout=timeout)
+    except Exception as e:
+        logger.warning("Failed to call favouriteCity API: %s", e)
+        return None
+    if not r.ok:
+        logger.warning("FavouriteCity endpoint returned non-OK status: %s", r.status_code)
+        return None
+    try:
+        j = r.json()
+    except Exception:
+        txt = r.text
+        # fallback: try to pull any known city word — caller can handle None
+        return None
+
+    # try various keys
+    candidate = None
+    if isinstance(j, dict):
+        # top-level keys
+        for k in ("favoriteCity", "favouriteCity", "city", "cityName", "favorite_city"):
+            if k in j and j[k]:
+                candidate = j[k]
+                break
+        # nested data
+        if not candidate and "data" in j and isinstance(j["data"], dict):
+            for k in ("favoriteCity", "favouriteCity", "city", "cityName"):
+                if k in j["data"] and j["data"][k]:
+                    candidate = j["data"][k]
+                    break
+    # final normalization
+    if isinstance(candidate, str):
+        return candidate.strip()
+    return None
+
+def choose_flight_endpoint_for_landmark(landmark: str) -> str:
+    # endpoints as per brief (full path appended to base)
+    endpoint_map = {
+        "Gateway of India": "/teams/public/flights/getFirstCityFlightNumber",
+        "Taj Mahal": "/teams/public/flights/getSecondCityFlightNumber",
+        "Eiffel Tower": "/teams/public/flights/getThirdCityFlightNumber",
+        "Big Ben": "/teams/public/flights/getFourthCityFlightNumber",
+    }
+    return endpoint_map.get(landmark, "/teams/public/flights/getFifthCityFlightNumber")
+
 # ---------------- Main /hackrx/run endpoint ----------------
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
@@ -273,6 +403,8 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
     tmp_path = None
     try:
         start_time = asyncio.get_event_loop().time()
+
+        # Download (stream) the document like your original flow
         resp = requests.get(data.documents, stream=True, timeout=60)
         if resp.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to download document.")
@@ -283,56 +415,68 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 if chunk:
                     tf.write(chunk)
             tmp_path = tf.name
+        logger.info("✅ Document saved to temporary path: %s", tmp_path)
 
-        # --- Puzzle Detection ---
-        if extension == ".pdf":
+        # --- PUZZLE DETECTION & SOLVE (robust) ---
+        if extension.lower() == ".pdf":
             try:
-                pdf_text = []
-                with fitz.open(tmp_path) as pdf:
-                    for p in range(min(5, pdf.page_count)):
-                        txt = pdf.load_page(p).get_text("text")
-                        if txt:
-                            pdf_text.append(txt)
-                joined_text = "\n".join(pdf_text)
-            except Exception:
-                joined_text = ""
+                # scan first pages (mission brief is small)
+                mapping = extract_city_landmark_mapping_from_pdf(tmp_path, max_pages_to_scan=30)
+                if mapping:
+                    logger.info("Detected city->landmark mapping: %s", mapping)
+                    fav_city = fetch_favorite_city_from_api()
+                    if fav_city:
+                        logger.info("Favourite city from API: %s", fav_city)
+                        # try exact then fuzzy match
+                        lm = mapping.get(fav_city)
+                        if not lm:
+                            for city_key, landmark_val in mapping.items():
+                                if fav_city.lower() == city_key.lower() or fav_city.lower() in city_key.lower() or city_key.lower() in fav_city.lower():
+                                    lm = landmark_val
+                                    break
+                        if lm:
+                            endpoint = choose_flight_endpoint_for_landmark(lm)
+                            base = "https://register.hackrx.in"
+                            flight_url = base + endpoint
+                            logger.info("Calling flight endpoint: %s (landmark=%s)", flight_url, lm)
+                            try:
+                                r = requests.get(flight_url, timeout=15)
+                                if r.ok:
+                                    jr = r.json()
+                                    # try common shapes
+                                    fn = None
+                                    if isinstance(jr, dict):
+                                        fn = jr.get("data", {}).get("flightNumber") or jr.get("data", {}).get("flightnumber") or jr.get("flightNumber") or jr.get("flightnumber")
+                                    if not fn:
+                                        # try nested deeper or message parsing fallback
+                                        # search for hex-like token in text
+                                        txt = r.text
+                                        m = re.search(r'([0-9a-fA-F]{4,})', txt)
+                                        if m:
+                                            fn = m.group(1)
+                                    if fn:
+                                        return {"answers": [fn]}
+                                    else:
+                                        # endpoint returned but no flight number found
+                                        logger.warning("Flight endpoint returned no flightNumber field. Response: %s", jr)
+                                        # fallback: return full response text as single answer (still JSON)
+                                        return {"answers": [r.text.strip()]}
+                                else:
+                                    logger.warning("Flight endpoint returned non-OK status %s", r.status_code)
+                            except Exception as e:
+                                logger.warning("Calling flight endpoint failed: %s", e)
+                        else:
+                            logger.info("No landmark matched for favourite city: %s", fav_city)
+                    else:
+                        logger.info("Could not fetch favourite city from the API.")
+            except Exception as e:
+                logger.debug("Puzzle detection attempt failed or not a puzzle doc: %s", e)
+        # --- END PUZZLE HANDLING ---
 
-            if "Mission Brief" in joined_text and "Landmarks" in joined_text:
-                mapping = {}
-                lines = joined_text.splitlines()
-                for line in lines:
-                    if " - " in line:
-                        parts = line.split(" - ")
-                        if len(parts) == 2:
-                            mapping[parts[0].strip()] = parts[1].strip()
-                fav_city = None
-                for line in lines:
-                    if "favouriteCity" in line or "favoriteCity" in line:
-                        try:
-                            api_url = line.strip()
-                            r = requests.get(api_url, timeout=10)
-                            if r.ok:
-                                fav_city = r.json().get("favoriteCity")
-                        except:
-                            pass
-                        break
-                if fav_city and fav_city in mapping:
-                    landmark = mapping[fav_city]
-                    endpoint_map = {
-                        "Gateway of India": "/flights/getFirstCityFlightNumber",
-                        "Taj Mahal": "/flights/getSecondCityFlightNumber",
-                        "Eiffel Tower": "/flights/getThirdCityFlightNumber",
-                        "Big Ben": "/flights/getFourthCityFlightNumber"
-                    }
-                    base_url = "https://register.hackrx.in"
-                    endpoint = endpoint_map.get(landmark, "/flights/getFifthCityFlightNumber")
-                    r = requests.get(base_url + endpoint, timeout=10)
-                    if r.ok:
-                        flight_number = r.json().get("data", {}).get("flightNumber")
-                        return {"answers": [flight_number]}
-        # --- End Puzzle Detection ---
-
+        # If not puzzle or puzzle handling didn't return, proceed with original RAG pipeline
         ext = os.path.splitext(tmp_path)[1].lower()
+        vector_store = None
+
         if ext == ".pdf":
             try:
                 pdf_doc = fitz.open(tmp_path)
@@ -340,16 +484,31 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 pdf_doc.close()
             except Exception:
                 page_count = 0
-            if page_count <= 10:
-                chunk_size = 600
-            elif page_count <= 200:
+
+            if page_count == 0:
                 chunk_size = 1000
-            elif page_count <= 800:
-                chunk_size = 1200
             else:
-                chunk_size = 1500
-            vector_store = build_faiss_index_from_pdf(tmp_path, embeddings, chunk_size=chunk_size)
+                if page_count <= 10:
+                    chunk_size = 600
+                elif page_count <= 200:
+                    chunk_size = 1000
+                elif page_count <= 800:
+                    chunk_size = 1200
+                else:
+                    chunk_size = 1500
+
+            logger.info("PDF detected (pages=%d). Using chunk_size=%d", page_count, chunk_size)
+
+            vector_store = build_faiss_index_from_pdf(
+                pdf_path=tmp_path,
+                embeddings=embeddings,
+                chunk_size=chunk_size,
+                chunk_overlap=CHUNK_OVERLAP,
+                batch_pages=BATCH_SIZE_PAGES,
+                max_chunks=MAX_CHUNKS
+            )
         else:
+            # Non-pdf handling
             docs = []
             if ext in [".zip", ".rar", ".7z"]:
                 if ext == ".zip":
@@ -360,21 +519,47 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                     docs = extract_and_load(tmp_path, py7zr.SevenZipFile)
             else:
                 docs = load_non_pdf(tmp_path)
-            docs = [d for d in docs if d.page_content.strip() >= MIN_CHUNK_LEN]
+
+            docs = [d for d in docs if d.page_content and len(d.page_content.strip()) >= MIN_CHUNK_LEN]
+            if not docs:
+                raise HTTPException(status_code=400, detail="No readable content found in document.")
+
             splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
-            chunks = splitter.split_documents(docs)[:MAX_CHUNKS]
+            chunks = splitter.split_documents(docs)
+            chunks = chunks[:MAX_CHUNKS]
             vector_store = FAISS.from_documents(chunks, embeddings)
 
+        # detect language from first stored chunk if possible
         try:
             first_doc = next(iter(vector_store.docstore._dict.values()), None)
-            content_language = detect(first_doc.page_content) if first_doc else "unknown"
-        except:
+            if first_doc and first_doc.page_content:
+                content_language = detect(first_doc.page_content)
+            else:
+                content_language = "unknown"
+        except Exception:
             content_language = "unknown"
 
+        # Answer questions concurrently
         tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
+
+        total_time = asyncio.get_event_loop().time() - start_time
+        logger.info("✅ Processing complete in %.2f seconds. Chunks indexed (approx cap %d).", total_time, MAX_CHUNKS)
+
         return {"answers": answers}
 
+    except ValueError as ve:
+        logger.error("❌ %s", ve)
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("❌ Unexpected error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        # cleanup temp file
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
