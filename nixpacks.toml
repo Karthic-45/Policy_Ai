@@ -1,2 +1,0 @@
-[build]
-apt_pkgs = ["libmagic1", "libmagic-dev"]
