@@ -1,33 +1,17 @@
-# --- Core Backend ---
 fastapi
 uvicorn[standard]
-
-# --- Environment Variables ---
 python-dotenv
-
-# --- LangChain Core ---
-langchain
+langchain>=0.2.0
 langchain-core
 langchain-openai
 langchain-community
-
-# --- Embeddings and Vector DB ---
 openai
 faiss-cpu
-
-# --- PDF Loading and Data Handling ---
+pandas
 PyMuPDF
 pydantic
-pandas
-
-# --- Token Counting ---
 tiktoken
-
-# --- Cosine Similarity ---
 scikit-learn
-
-# --- File Type Detection & OCR ---
-python-magic
-pillow
-pytesseract
-
+rarfile
+py7zr
+Pillow
