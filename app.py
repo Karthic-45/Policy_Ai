@@ -1,27 +1,29 @@
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import OpenAIEmbeddings
 import openai
 
 # CONFIG
-openai.api_key = os.getenv("OPENAI_API_KEY")
-if not openai.api_key:
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
     raise ValueError("Missing OPENAI_API_KEY in environment")
+
+os.environ["OPENAI_API_KEY"] = openai_api_key
 
 INDEX_PATH = "faiss_index"
 
 app = FastAPI(title="HackRx Insurance Q&A API")
 
-# Load FAISS index on startup
 embeddings = OpenAIEmbeddings()
+vectorstore = None
+
 try:
     vectorstore = FAISS.load_local(INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
     print("✅ FAISS index loaded successfully.")
 except Exception as e:
     print(f"❌ Error loading FAISS index: {e}")
-    vectorstore = None
 
 class QueryRequest(BaseModel):
     question: str
@@ -33,13 +35,12 @@ def health_check():
 @app.post("/hackrx")
 async def ask_question(request: QueryRequest):
     if vectorstore is None:
-        raise HTTPException(status_code=500, detail="FAISS index not loaded. Please run create_index first.")
+        raise HTTPException(status_code=500, detail="FAISS index not loaded. Run create_index.py first.")
 
     question = request.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    # Retrieve top 5 relevant chunks
     docs = vectorstore.similarity_search(question, k=5)
     if not docs:
         raise HTTPException(status_code=404, detail="No relevant information found in documents.")
