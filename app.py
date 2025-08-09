@@ -9,7 +9,7 @@ import logging
 import fitz  # PyMuPDF
 from typing import List, Optional, Iterable
 from langdetect import detect
-from bs4 import BeautifulSoup  # NEW for HTML parsing
+from bs4 import BeautifulSoup
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from fastapi import FastAPI, HTTPException, Header
@@ -17,16 +17,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+# ✅ Updated imports to avoid deprecation warnings
+from langchain_community.document_loaders import (
+    TextLoader,
+    UnstructuredEmailLoader,
+    UnstructuredImageLoader
+)
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
 from langchain.schema import Document
-from langchain.document_loaders import (
-    TextLoader,
-    UnstructuredEmailLoader,
-    UnstructuredImageLoader
-)
 
 from PIL import Image
 import rarfile
@@ -38,7 +39,9 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-# ------------------------------------------------
+
+# Force FAISS to CPU mode only
+os.environ["FAISS_NO_GPU"] = "1"
 
 # Load environment variables
 load_dotenv()
@@ -110,7 +113,6 @@ class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# Health check
 @app.get("/")
 def health():
     return {"status": "API is running"}
@@ -125,8 +127,6 @@ def load_non_pdf(file_path: str) -> List[Document]:
             soup = BeautifulSoup(html_content, "html.parser")
             text = soup.get_text(separator="\n", strip=True)
             return [Document(page_content=text)]
-        elif ext in [".doc", ".docx", ".pptx"]:
-            raise HTTPException(status_code=400, detail="DOC/DOCX/PPTX not supported without unstructured package.")
         elif ext in [".txt", ".md"]:
             return TextLoader(file_path).load()
         elif ext == ".eml":
@@ -168,11 +168,8 @@ def iter_pdf_pages_as_documents(pdf_path: str) -> Iterable[Document]:
         for pno in range(doc.page_count):
             page = doc.load_page(pno)
             text = page.get_text("text") or ""
-            text = text.strip()
-            if not text:
-                continue
-            meta = {"page": pno + 1, "source": os.path.basename(pdf_path)}
-            yield Document(page_content=text, metadata=meta)
+            if text.strip():
+                yield Document(page_content=text.strip(), metadata={"page": pno + 1, "source": os.path.basename(pdf_path)})
     finally:
         doc.close()
 
@@ -188,77 +185,44 @@ def extract_and_load(file_path, archive_class):
             for root, _, files in os.walk(extract_dir):
                 for file in files:
                     full_path = os.path.join(root, file)
-                    ext = os.path.splitext(full_path)[1].lower()
-                    if ext == ".pdf":
+                    if full_path.lower().endswith(".pdf"):
                         docs.append(Document(page_content=f"[PDF IN ARCHIVE]: {full_path}", metadata={"path": full_path}))
                     else:
                         docs.extend(load_non_pdf(full_path))
     return docs
 
 # ---------------- Incremental FAISS builder ----------------
-def build_faiss_index_from_pdf(pdf_path: str,
-                               embeddings,
-                               chunk_size: int = 1200,
-                               chunk_overlap: int = CHUNK_OVERLAP,
-                               batch_pages: int = BATCH_SIZE_PAGES,
-                               max_chunks: int = MAX_CHUNKS) -> FAISS:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ".", " "]
-    )
-
+def build_faiss_index_from_pdf(pdf_path: str, embeddings, chunk_size: int, chunk_overlap: int, batch_pages: int, max_chunks: int) -> FAISS:
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     faiss_index = None
     total_chunks = 0
-    batch_docs: List[Document] = []
-    pages_in_batch = 0
+    batch_docs = []
 
     for page_doc in iter_pdf_pages_as_documents(pdf_path):
-        pages_in_batch += 1
         batch_docs.append(page_doc)
-
-        if pages_in_batch >= batch_pages:
-            split_chunks = splitter.split_documents(batch_docs)
-            split_chunks = [c for c in split_chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
-
+        if len(batch_docs) >= batch_pages:
+            split_chunks = [c for c in splitter.split_documents(batch_docs) if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
             allowed = max_chunks - total_chunks
             if allowed <= 0:
-                logger.info("Reached max_chunks cap (%d). Stopping indexing.", max_chunks)
                 break
-            if len(split_chunks) > allowed:
-                split_chunks = split_chunks[:allowed]
-
+            split_chunks = split_chunks[:allowed]
             if split_chunks:
                 if faiss_index is None:
                     faiss_index = FAISS.from_documents(split_chunks, embeddings)
                 else:
                     faiss_index.add_documents(split_chunks)
-
                 total_chunks += len(split_chunks)
-
             batch_docs = []
-            pages_in_batch = 0
 
-            if total_chunks >= max_chunks:
-                break
+    if batch_docs and total_chunks < max_chunks:
+        split_chunks = [c for c in splitter.split_documents(batch_docs) if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
+        split_chunks = split_chunks[:max_chunks - total_chunks]
+        if faiss_index is None:
+            faiss_index = FAISS.from_documents(split_chunks, embeddings)
+        else:
+            faiss_index.add_documents(split_chunks)
 
-    if pages_in_batch > 0 and total_chunks < max_chunks:
-        split_chunks = splitter.split_documents(batch_docs)
-        split_chunks = [c for c in split_chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
-        allowed = max_chunks - total_chunks
-        if len(split_chunks) > allowed:
-            split_chunks = split_chunks[:allowed]
-        if split_chunks:
-            if faiss_index is None:
-                faiss_index = FAISS.from_documents(split_chunks, embeddings)
-            else:
-                faiss_index.add_documents(split_chunks)
-            total_chunks += len(split_chunks)
-
-    if faiss_index is None:
-        faiss_index = FAISS.from_documents([Document(page_content="")], embeddings)
-
-    return faiss_index
+    return faiss_index or FAISS.from_documents([Document(page_content="")], embeddings)
 
 # ---------------- Async QA helper ----------------
 async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
@@ -266,51 +230,36 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         lang = detect(question)
     except Exception:
         lang = "en"
-    top_k = 6
-    docs = vector_store.similarity_search(question, k=top_k)
+    docs = vector_store.similarity_search(question, k=6)
     if not docs:
         return "The policy document does not specify this clearly."
-    raw = await chain.ainvoke({
-        "context": docs,
-        "input": question,
-        "language": lang
-    })
+    raw = await chain.ainvoke({"context": docs, "input": question, "language": lang})
     answer = raw.strip()
-    if not answer or "i don't know" in answer.lower():
-        return "The policy document does not specify this clearly."
-    return answer
+    return answer if answer and "i don't know" not in answer.lower() else "The policy document does not specify this clearly."
 
 # ---------------- Main /hackrx/run endpoint ----------------
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     global content_language
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
-
     logger.info("📥 /hackrx/run request received for document: %s", data.documents)
 
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-
-    token = authorization.split("Bearer ")[1]
-    if token != expected_token:
+    if authorization.split("Bearer ")[1] != expected_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
 
     tmp_path = None
     try:
-        import time
-        start_time = time.time()
-
+        start_time = asyncio.get_event_loop().time()
         resp = requests.get(data.documents, stream=True, timeout=60)
         if resp.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
-        content_type = resp.headers.get("content-type", "")
-        extension = mimetypes.guess_extension(content_type.split(";")[0]) or os.path.splitext(data.documents)[1] or ".bin"
-
+        extension = mimetypes.guess_extension(resp.headers.get("content-type", "").split(";")[0]) or os.path.splitext(data.documents)[1] or ".bin"
         with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tf:
             for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    tf.write(chunk)
+                tf.write(chunk)
             tmp_path = tf.name
 
         ext = os.path.splitext(tmp_path)[1].lower()
@@ -318,31 +267,11 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
         if ext == ".pdf":
             try:
-                pdf_doc = fitz.open(tmp_path)
-                page_count = pdf_doc.page_count
-                pdf_doc.close()
+                page_count = fitz.open(tmp_path).page_count
             except Exception:
                 page_count = 0
-
-            if page_count == 0:
-                chunk_size = 1000
-            elif page_count <= 10:
-                chunk_size = 600
-            elif page_count <= 200:
-                chunk_size = 1000
-            elif page_count <= 800:
-                chunk_size = 1200
-            else:
-                chunk_size = 1500
-
-            vector_store = build_faiss_index_from_pdf(
-                pdf_path=tmp_path,
-                embeddings=embeddings,
-                chunk_size=chunk_size,
-                chunk_overlap=CHUNK_OVERLAP,
-                batch_pages=BATCH_SIZE_PAGES,
-                max_chunks=MAX_CHUNKS
-            )
+            chunk_size = 600 if page_count <= 10 else 1000 if page_count <= 200 else 1200 if page_count <= 800 else 1500
+            vector_store = build_faiss_index_from_pdf(tmp_path, embeddings, chunk_size, CHUNK_OVERLAP, BATCH_SIZE_PAGES, MAX_CHUNKS)
         else:
             docs = []
             if ext in [".zip", ".rar", ".7z"]:
@@ -354,44 +283,21 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                     docs = extract_and_load(tmp_path, py7zr.SevenZipFile)
             else:
                 docs = load_non_pdf(tmp_path)
-
             docs = [d for d in docs if d.page_content and len(d.page_content.strip()) >= MIN_CHUNK_LEN]
             if not docs:
                 raise HTTPException(status_code=400, detail="No readable content found in document.")
-
-            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
-            chunks = splitter.split_documents(docs)
-            chunks = chunks[:MAX_CHUNKS]
+            chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP).split_documents(docs)[:MAX_CHUNKS]
             vector_store = FAISS.from_documents(chunks, embeddings)
 
         try:
-            first_doc = None
-            for k in vector_store.docstore._dict:
-                first_doc = vector_store.docstore._dict[k]
-                break
-            if first_doc and first_doc.page_content:
-                content_language = detect(first_doc.page_content)
-            else:
-                content_language = "unknown"
+            first_doc = next(iter(vector_store.docstore._dict.values()), None)
+            content_language = detect(first_doc.page_content) if first_doc and first_doc.page_content else "unknown"
         except Exception:
             content_language = "unknown"
 
-        tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
-        answers = await asyncio.gather(*tasks)
-
-        total_time = time.time() - start_time
-        logger.info("✅ Processing complete in %.2f seconds.", total_time)
-
+        answers = await asyncio.gather(*[ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions])
+        logger.info("✅ Processing complete in %.2f seconds.", asyncio.get_event_loop().time() - start_time)
         return {"answers": answers}
-
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        logger.exception("❌ Unexpected error: %s", e)
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
     finally:
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
