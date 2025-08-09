@@ -8,6 +8,7 @@ langchain-community
 openai
 faiss-cpu
 pandas
+langdetect
 PyMuPDF
 pydantic
 tiktoken
