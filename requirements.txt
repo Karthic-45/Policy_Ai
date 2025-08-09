@@ -1,33 +1,28 @@
-# --- Core Backend Framework ---
+# --- Core Backend ---
 fastapi
 uvicorn[standard]
 
-# --- LangChain & AI Integrations ---
-# The core framework and integrations with OpenAI and Community models/loaders
+# --- LangChain Core + OpenAI Support ---
 langchain>=0.2.0
-langchain-community
+langchain-core
 langchain-openai
+langchain-community
+openai
 
-# --- Local Embeddings & Model Handling ---
-# PyTorch and sentence-transformers are the foundation for HuggingFace embeddings
-torch
-sentence-transformers
-# Accelerate helps optimize model loading, especially from Hugging Face
-accelerate
+# --- Embeddings & Vector Store (CPU version) ---
+faiss-cpu
+tiktoken
+scikit-learn
 
-# --- Document Processing ---
-# PyMuPDF is for PDF files, docx2txt is for .docx files
-PyMuPDF
-docx2txt
-
-# --- Vector Store ---
-# GPU-optimized version of Facebook's similarity search library
-faiss-gpu
+# --- File Handling ---
+PyMuPDF            # PDF
+python-docx        # DOCX
+python-multipart   # ZIP, File Uploads
+docx2txt           # Optional: extra text extraction from DOCX
+pandas             # CSV
+json5              # JSON with comments/flexibility
 
 # --- Utilities ---
-# For handling environment variables
+pydantic
 python-dotenv
-# For making HTTP requests to download documents
 requests
-# For token counting with OpenAI models
-tiktoken
