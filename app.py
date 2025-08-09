@@ -20,12 +20,10 @@ from langchain.docstore.document import Document
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.prompts import ChatPromptTemplate
 
-load_dotenv()
+load_dotenv()  # Loads .env if running locally; Railway uses actual env vars
 
-# FastAPI app
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,33 +32,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request model for your given JSON format
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# Loader function
 def load_documents(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[-1].lower()
 
     if ext == ".pdf":
         return PyMuPDFLoader(file_path).load()
-
     elif ext == ".docx":
         return Docx2txtLoader(file_path).load()
-
     elif ext == ".csv":
         return CSVLoader(file_path).load()
-
     elif ext == ".json":
         return JSONLoader(file_path).load()
-
     elif ext == ".zip":
         return UnstructuredFileLoader(file_path).load()
-
     elif ext in [".txt", ".md", ".html", ".pptx", ".xlsx"]:
         return UnstructuredFileLoader(file_path).load()
-
     elif ext == ".bin":
         try:
             with open(file_path, "rb") as f:
@@ -72,11 +62,9 @@ def load_documents(file_path: str) -> List[Document]:
             return [Document(page_content=text, metadata={"source": file_path})]
         except Exception as e:
             raise ValueError(f"Failed to load .bin file: {e}")
-
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
-# File downloader
 async def download_file(url: str) -> str:
     response = requests.get(url, stream=True)
     if response.status_code != 200:
@@ -88,33 +76,35 @@ async def download_file(url: str) -> str:
             tmp_file.write(chunk)
         return tmp_file.name
 
-# Main endpoint
 @app.post("/hackrx/run")
 async def run_query(request: QueryRequest, authorization: str = Header(None)):
-    if authorization != f"Bearer {os.getenv('API_KEY')}":
+    expected_token = os.getenv("HACKRX_BEARER_TOKEN")
+    if authorization != f"Bearer {expected_token}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Download & load the single document
+    # Download & load document
     file_path = await download_file(request.documents)
     all_docs = load_documents(file_path)
 
-    # Create FAISS vector store
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+    # Embeddings & FAISS vector store using your EMBEDDING_MODEL env variable
+    embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
+    embeddings = OpenAIEmbeddings(model=embedding_model)
     vectorstore = FAISS.from_documents(all_docs, embeddings)
     retriever = vectorstore.as_retriever()
 
-    # LLM
-    llm = ChatOpenAI(model="gpt-4", temperature=0)
+    # LLM using your CHAT_MODEL env variable (default gpt-3.5-turbo)
+    chat_model = os.getenv("CHAT_MODEL", "gpt-4")
+    llm = ChatOpenAI(model=chat_model, temperature=0)
+
     prompt = ChatPromptTemplate.from_template(
         "Answer the question based on the documents:\n\n{context}\n\nQuestion: {question}"
     )
     chain = create_stuff_documents_chain(llm, prompt)
 
-    # Loop through each question
     results = []
-    for q in request.questions:
-        retrieved_docs = retriever.get_relevant_documents(q)
-        answer = chain.run({"context": retrieved_docs, "question": q})
-        results.append({"question": q, "answer": answer})
+    for question in request.questions:
+        retrieved_docs = retriever.get_relevant_documents(question)
+        answer = chain.run({"context": retrieved_docs, "question": question})
+        results.append({"question": question, "answer": answer})
 
     return {"status": "success", "results": results}
