@@ -1,13 +1,34 @@
+# --- Core Backend ---
 fastapi
-uvicorn
+uvicorn[standard]
+
+# --- Environment Variables ---
 python-dotenv
-langchain
-langchain-community
-langchain-openai
-pypdf
-pymupdf
-docx2txt
-pandas
-unstructured
-requests
+
+# --- LangChain Core ---
+langchain>=0.2.0
+langchain-core>=0.3.0
+langchain-openai>=0.1.7
+langchain-community>=0.0.36
+
+# --- OpenAI ---
+openai
+
+# --- Vector Store ---
 faiss-cpu
+
+# --- PDF / DOCX / PPTX / XLSX / CSV Handling ---
+PyMuPDF
+pandas
+python-docx
+python-pptx
+openpyxl
+
+# --- Token Counting ---
+tiktoken
+
+# --- Cosine Similarity ---
+scikit-learn
+
+# --- File Type Detection ---
+python-magic
