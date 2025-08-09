@@ -46,12 +46,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global models
+# Global variables
 vector_store = None
 qa_chain = None
+
+# Model initialization
 try:
-    print("\U0001F50D Initializing models...")
+    print("🔍 Initializing models...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise ValueError("OPENAI_API_KEY not set in environment variables.")
     os.environ["OPENAI_API_KEY"] = openai_api_key
 
     embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
@@ -74,7 +78,7 @@ try:
     """)
 
     qa_chain = create_stuff_documents_chain(llm, prompt)
-    print("✅ Models initialized.")
+    print("✅ Models initialized successfully.")
 except Exception as e:
     print(f"❌ Error initializing models: {e}")
 
@@ -86,11 +90,12 @@ class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# Health check route
+# Health check
 @app.get("/")
 def health():
     return {"status": "API is running"}
 
+# Question answering route
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
     if not vector_store or not qa_chain:
@@ -109,6 +114,7 @@ def ask_question(request: QuestionRequest):
         "source_chunks": [doc.page_content for doc in relevant_chunks]
     }
 
+# Document loader
 def load_documents(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
 
@@ -122,7 +128,6 @@ def load_documents(file_path: str) -> List[Document]:
         elif ext == ".eml":
             return UnstructuredEmailLoader(file_path).load()
         elif ext in [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff"]:
-            # Try extracting text if possible, else return metadata
             try:
                 return UnstructuredImageLoader(file_path).load()
             except Exception:
@@ -139,72 +144,40 @@ def load_documents(file_path: str) -> List[Document]:
             except Exception:
                 with open(file_path, "rb") as f:
                     raw = f.read()
-                hex_preview = raw[:512].hex()
-                return [Document(page_content=f"[BINARY XLSX FILE PREVIEW - first 512 bytes in hex]: {hex_preview}")]
+                return [Document(page_content=f"[BINARY XLSX FILE PREVIEW]: {raw[:512].hex()}")]
         elif ext == ".zip":
-            docs = []
-            with tempfile.TemporaryDirectory() as extract_dir:
-                with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    zip_ref.extractall(extract_dir)
-                    for root, _, files in os.walk(extract_dir):
-                        for file in files:
-                            full_path = os.path.join(root, file)
-                            try:
-                                docs.extend(load_documents(full_path))
-                            except Exception as e:
-                                print(f"⚠ Skipped file in ZIP: {file} ({e})")
-            return docs
+            return extract_and_load(file_path, zipfile.ZipFile)
         elif ext == ".rar":
-            docs = []
-            with tempfile.TemporaryDirectory() as extract_dir:
-                try:
-                    with rarfile.RarFile(file_path) as rar_ref:
-                        rar_ref.extractall(extract_dir)
-                        for root, _, files in os.walk(extract_dir):
-                            for file in files:
-                                full_path = os.path.join(root, file)
-                                try:
-                                    docs.extend(load_documents(full_path))
-                                except Exception as e:
-                                    print(f"⚠ Skipped file in RAR: {file} ({e})")
-                except rarfile.BadRarFile as e:
-                    raise ValueError(f"Invalid RAR file: {file_path} ({e})")
-            return docs
+            return extract_and_load(file_path, rarfile.RarFile)
         elif ext == ".7z":
-            docs = []
-            with tempfile.TemporaryDirectory() as extract_dir:
-                try:
-                    with py7zr.SevenZipFile(file_path, mode='r') as archive:
-                        archive.extractall(path=extract_dir)
-                        for root, _, files in os.walk(extract_dir):
-                            for file in files:
-                                full_path = os.path.join(root, file)
-                                try:
-                                    docs.extend(load_documents(full_path))
-                                except Exception as e:
-                                    print(f"⚠ Skipped file in 7z: {file} ({e})")
-                except Exception as e:
-                    raise ValueError(f"Invalid 7z file: {file_path} ({e})")
-            return docs
+            return extract_and_load(file_path, py7zr.SevenZipFile)
         else:
-            # Fallback for unknown or binary formats
             with open(file_path, "rb") as f:
                 raw_data = f.read()
-
             try:
                 decoded = raw_data.decode("utf-8")
             except UnicodeDecodeError:
                 decoded = raw_data.decode("latin-1", errors="ignore")
-
-            printable_ratio = sum(c.isprintable() or c.isspace() for c in decoded) / max(1, len(decoded))
-            if printable_ratio > 0.7:
-                return [Document(page_content=decoded)]
-            else:
-                hex_preview = raw_data[:512].hex()
-                return [Document(page_content=f"[BINARY FILE PREVIEW - first 512 bytes in hex]: {hex_preview}")]
+            return [Document(page_content=decoded)]
     except Exception as e:
         raise ValueError(f"Could not read file: {file_path} ({e})")
 
+# Helper: extract and load archives
+def extract_and_load(file_path, archive_class):
+    docs = []
+    with tempfile.TemporaryDirectory() as extract_dir:
+        with archive_class(file_path) as archive:
+            archive.extractall(extract_dir)
+            for root, _, files in os.walk(extract_dir):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    try:
+                        docs.extend(load_documents(full_path))
+                    except Exception as e:
+                        print(f"⚠ Skipped file in archive: {file} ({e})")
+    return docs
+
+# Async question answering
 async def ask_async(llm_chain, vector_store, question):
     rel_chunks = vector_store.similarity_search(question, k=12)
     raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
@@ -213,6 +186,7 @@ async def ask_async(llm_chain, vector_store, question):
         return "The policy document does not specify this clearly."
     return answer
 
+# Main HackRx API route
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
@@ -226,12 +200,11 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         import time
         start_time = time.time()
 
-        # Download file
+        print(f"📄 Downloading document from: {data.documents}")
         response = requests.get(data.documents)
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
-        # Guess extension
         mime_type = response.headers.get("content-type", "")
         extension = mimetypes.guess_extension(mime_type) or ".bin"
 
@@ -239,14 +212,12 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             tmp.write(response.content)
             tmp_path = tmp.name
 
-        # Load documents
         docs = load_documents(tmp_path)
         docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
 
         if not docs:
             raise HTTPException(status_code=400, detail="No valid content found in document.")
 
-        # Chunking
         page_count = len(docs)
         chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
 
@@ -258,20 +229,15 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         chunks = splitter.split_documents(docs)
         chunks = chunks[:300]
 
-        # FAISS vector store
         temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
 
-        # Q&A tasks
         tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
         total_time = time.time() - start_time
-        print(f"⏱ Total Time: {total_time:.2f} sec")
+        print(f"✅ Processed in {total_time:.2f} seconds.")
 
-        return {
-            "status": "success",
-            "answers": answers
-        }
+        return {"status": "success", "answers": answers}
 
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
