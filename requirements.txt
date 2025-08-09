@@ -1,33 +1,13 @@
-# --- Core Backend ---
 fastapi
-uvicorn[standard]
-
-# --- Environment Variables ---
+uvicorn
 python-dotenv
-
-# --- LangChain Core ---
-langchain>=0.2.0
-langchain-core>=0.3.0
-langchain-community>=0.0.36
-
-# --- PDF, DOCX, Image, and Unstructured File Handling ---
-PyMuPDF
-unstructured
-
-# --- File Type Detection ---
-python-magic
-
-# --- Data Handling ---
+langchain
+langchain-community
+langchain-openai
+pypdf
+pymupdf
+docx2txt
 pandas
-openpyxl     # Excel reading
-python-pptx  # PPTX reading
-pydantic
-
-# --- CSV & Excel ---
-xlrd
-
-# --- Token Counting (Optional for OpenAI/LangChain Integration) ---
-tiktoken
-
-# --- Cosine Similarity (Optional for Search) ---
-scikit-learn
+unstructured
+requests
+faiss-cpu
