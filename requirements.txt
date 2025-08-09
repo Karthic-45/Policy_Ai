@@ -1,34 +1,29 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-aiohttp==3.9.0
-python-dotenv==1.0.0
+# --- Core Backend ---
+fastapi
+uvicorn[standard]
 
-# LangChain stack
-langchain==0.1.0
-langchain-openai==0.0.2
-langchain-community==0.0.10
-langchain-core==0.1.0
+# --- Environment Variables ---
+python-dotenv
 
-# Document processing
-PyMuPDF==1.23.8
-PyPDF2==3.0.1
-unstructured==0.11.8
-python-magic==0.4.27
-python-magic-bin==0.4.14  # For Windows
-Pillow==10.1.0
-pytesseract==0.3.10
-pandas==2.1.4
-rarfile==4.1
-openpyxl==3.1.2
+# --- LangChain Core ---
+langchain>=0.2.0
+langchain-core>=0.3.0
+langchain-openai>=0.1.7
+langchain-community>=0.0.36
 
-# ML/AI components
-openai==1.3.0
-sentence-transformers==2.2.2
-scikit-learn==1.3.2
-numpy==1.24.3
-tiktoken==0.5.1
-faiss-cpu==1.7.4  # Use faiss-gpu if you have GPU
+# --- Embeddings and Vector DB ---
+openai
+faiss-cpu
 
-# Additional utilities
-pydantic==2.5.0
-python-multipart==0.0.6
+# --- PDF Loading and Data Handling ---
+PyMuPDF
+pydantic
+
+# --- Token Counting (for OpenAI models) ---
+tiktoken
+
+# --- Cosine Similarity ---
+scikit-learn
+
+# --- File Type Detection ---
+python-magic
