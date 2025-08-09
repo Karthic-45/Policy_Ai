@@ -6,6 +6,7 @@ import zipfile
 import mimetypes
 import pandas as pd
 from typing import List, Optional
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
