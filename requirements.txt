@@ -16,3 +16,4 @@ scikit-learn
 rarfile
 py7zr
 Pillow
+pip install beautifulsoup4
