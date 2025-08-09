@@ -40,8 +40,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Force FAISS to CPU mode only
+# Force FAISS to CPU mode only & disable AVX512 SPR to avoid module errors
 os.environ["FAISS_NO_GPU"] = "1"
+os.environ["FAISS_DISABLE_AVX512_SPR"] = "1"
+
+import faiss
+try:
+    faiss.omp_set_num_threads(1)
+    logger.info("✅ FAISS initialized in CPU-only mode without AVX512-Spring or GPU.")
+except Exception as e:
+    logger.warning("⚠️ FAISS CPU initialization warning: %s", e)
 
 # Load environment variables
 load_dotenv()
@@ -257,7 +265,6 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
         content_type = resp.headers.get("content-type", "").split(";")[0]
-        # Allow HTML files instead of blocking secret-token pages
         if "text/html" in content_type.lower():
             logger.info("📄 HTML document detected. Processing as HTML file.")
             extension = ".html"
