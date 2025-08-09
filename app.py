@@ -5,8 +5,9 @@ import requests
 import zipfile
 import mimetypes
 import pandas as pd
+import logging
 from typing import List, Optional
-from langdetect import detect  # ✅ Language detection
+from langdetect import detect
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from fastapi import FastAPI, HTTPException, Header
@@ -27,6 +28,14 @@ from langchain.document_loaders import (
 from PIL import Image
 import rarfile
 import py7zr
+
+# ---------------- Logging Setup ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+# ------------------------------------------------
 
 # Load environment variables
 load_dotenv()
@@ -50,11 +59,11 @@ app.add_middleware(
 # Global variables
 vector_store = None
 qa_chain = None
-content_language = None  # ✅ Store document content language globally
+content_language = None
 
 # Model initialization
 try:
-    print("🔍 Initializing models...")
+    logger.info("🔍 Initializing models...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
         raise ValueError("OPENAI_API_KEY not set in environment variables.")
@@ -81,9 +90,9 @@ try:
     """)
 
     qa_chain = create_stuff_documents_chain(llm, prompt)
-    print("✅ Models initialized successfully.")
+    logger.info("✅ Models initialized successfully.")
 except Exception as e:
-    print(f"❌ Error initializing models: {e}")
+    logger.error(f"❌ Error initializing models: {e}")
 
 # Request models
 class QuestionRequest(BaseModel):
@@ -103,22 +112,27 @@ def health():
 def ask_question(request: QuestionRequest):
     global content_language
     if not vector_store or not qa_chain:
+        logger.error("Model not loaded before /ask request")
         raise HTTPException(status_code=500, detail="Model not loaded.")
 
     question = request.question.strip()
     if not question:
+        logger.warning("Empty question received")
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    # ✅ Detect question language
     question_lang = detect(question)
+    logger.info(f"📥 Received question: {question} | Language: {question_lang}")
 
     relevant_chunks = vector_store.similarity_search(question, k=12)
+    logger.info(f"🔍 Found {len(relevant_chunks)} relevant chunks for the question.")
+
     response = qa_chain.invoke({
         "context": relevant_chunks,
         "input": question,
         "language": question_lang
     })
 
+    logger.info(f"✅ Answer generated for the question.")
     return {
         "question": question,
         "question_language": question_lang,
@@ -130,6 +144,7 @@ def ask_question(request: QuestionRequest):
 # Document loader
 def load_documents(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
+    logger.info(f"📂 Loading file: {file_path} | Extension: {ext}")
 
     try:
         if ext == ".pdf":
@@ -173,6 +188,7 @@ def load_documents(file_path: str) -> List[Document]:
                 decoded = raw_data.decode("latin-1", errors="ignore")
             return [Document(page_content=decoded)]
     except Exception as e:
+        logger.error(f"❌ Could not read file {file_path}: {e}")
         raise ValueError(f"Could not read file: {file_path} ({e})")
 
 # Helper: extract and load archives
@@ -187,13 +203,14 @@ def extract_and_load(file_path, archive_class):
                     try:
                         docs.extend(load_documents(full_path))
                     except Exception as e:
-                        print(f"⚠ Skipped file in archive: {file} ({e})")
+                        logger.warning(f"⚠ Skipped file in archive: {file} ({e})")
     return docs
 
 # Async question answering
 async def ask_async(llm_chain, vector_store, question):
     global content_language
     lang_code = detect(question)
+    logger.info(f"🔎 Processing async question: {question} | Language: {lang_code}")
 
     rel_chunks = vector_store.similarity_search(question, k=12)
     raw = await llm_chain.ainvoke({
@@ -203,12 +220,14 @@ async def ask_async(llm_chain, vector_store, question):
     })
     answer = raw.strip()
     if not answer or "i don't know" in answer.lower():
+        logger.info("⚠ Model could not find a confident answer.")
         return {
             "question": question,
             "question_language": lang_code,
             "content_language": content_language,
             "answer": "The policy document does not specify this clearly."
         }
+    logger.info("✅ Answer generated successfully.")
     return {
         "question": question,
         "question_language": lang_code,
@@ -221,19 +240,26 @@ async def ask_async(llm_chain, vector_store, question):
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     global content_language
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
+
+    logger.info("📥 /hackrx/run request received.")
+
     if not authorization or not authorization.startswith("Bearer "):
+        logger.error("❌ Missing or invalid Authorization header.")
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+
     token = authorization.split("Bearer ")[1]
     if token != expected_token:
+        logger.error("❌ Invalid Bearer token.")
         raise HTTPException(status_code=403, detail="Invalid token.")
 
     try:
         import time
         start_time = time.time()
 
-        print(f"📄 Downloading document from: {data.documents}")
+        logger.info(f"📄 Downloading document from: {data.documents}")
         response = requests.get(data.documents)
         if response.status_code != 200:
+            logger.error(f"❌ Failed to download document. HTTP {response.status_code}")
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
         mime_type = response.headers.get("content-type", "")
@@ -242,21 +268,26 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tmp:
             tmp.write(response.content)
             tmp_path = tmp.name
+        logger.info(f"✅ Document saved to temporary path: {tmp_path}")
 
         docs = load_documents(tmp_path)
         docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
+        logger.info(f"📄 Loaded {len(docs)} documents after filtering.")
 
         if not docs:
+            logger.error("❌ No valid content found in document.")
             raise HTTPException(status_code=400, detail="No valid content found in document.")
 
-        # ✅ Detect content language from first large enough chunk
         try:
             content_language = detect(docs[0].page_content)
+            logger.info(f"🌐 Detected document language: {content_language}")
         except:
             content_language = "unknown"
+            logger.warning("⚠ Could not detect document language.")
 
         page_count = len(docs)
         chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
+        logger.info(f"✂ Splitting into chunks with size: {chunk_size}")
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
@@ -265,6 +296,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         )
         chunks = splitter.split_documents(docs)
         chunks = chunks[:300]
+        logger.info(f"📦 Created {len(chunks)} chunks for vector store.")
 
         temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
 
@@ -272,11 +304,13 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         answers = await asyncio.gather(*tasks)
 
         total_time = time.time() - start_time
-        print(f"✅ Processed in {total_time:.2f} seconds.")
+        logger.info(f"✅ Processing complete in {total_time:.2f} seconds.")
 
         return {"status": "success", "answers": answers}
 
     except ValueError as ve:
+        logger.error(f"❌ {ve}")
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
+        logger.error(f"❌ Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
