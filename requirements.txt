@@ -8,22 +8,26 @@ python-dotenv
 # --- LangChain Core ---
 langchain>=0.2.0
 langchain-core>=0.3.0
-langchain-openai>=0.1.7
 langchain-community>=0.0.36
 
-# --- Embeddings and Vector DB ---
-openai
-faiss-cpu
-
-# --- PDF Loading and Data Handling ---
+# --- PDF, DOCX, Image, and Unstructured File Handling ---
 PyMuPDF
-pydantic
-pandas
-# --- Token Counting (for OpenAI models) ---
-tiktoken
-
-# --- Cosine Similarity ---
-scikit-learn
+unstructured
 
 # --- File Type Detection ---
 python-magic
+
+# --- Data Handling ---
+pandas
+openpyxl     # Excel reading
+python-pptx  # PPTX reading
+pydantic
+
+# --- CSV & Excel ---
+xlrd
+
+# --- Token Counting (Optional for OpenAI/LangChain Integration) ---
+tiktoken
+
+# --- Cosine Similarity (Optional for Search) ---
+scikit-learn
