@@ -9,6 +9,7 @@ import logging
 import fitz  # PyMuPDF
 from typing import List, Optional, Iterable
 from langdetect import detect
+from bs4 import BeautifulSoup  # NEW for HTML parsing
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from fastapi import FastAPI, HTTPException, Header
@@ -22,8 +23,9 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
 from langchain.schema import Document
 from langchain.document_loaders import (
-    UnstructuredFileLoader, TextLoader,
-    UnstructuredEmailLoader, UnstructuredImageLoader
+    TextLoader,
+    UnstructuredEmailLoader,
+    UnstructuredImageLoader
 )
 
 from PIL import Image
@@ -57,7 +59,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables (kept minimal)
+# Global variables
 qa_chain = None
 content_language = None
 
@@ -117,8 +119,14 @@ def health():
 def load_non_pdf(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
     try:
-        if ext in [".doc", ".docx", ".pptx", ".html", ".htm"]:
-            return UnstructuredFileLoader(file_path).load()
+        if ext in [".html", ".htm"]:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                html_content = f.read()
+            soup = BeautifulSoup(html_content, "html.parser")
+            text = soup.get_text(separator="\n", strip=True)
+            return [Document(page_content=text)]
+        elif ext in [".doc", ".docx", ".pptx"]:
+            raise HTTPException(status_code=400, detail="DOC/DOCX/PPTX not supported without unstructured package.")
         elif ext in [".txt", ".md"]:
             return TextLoader(file_path).load()
         elif ext == ".eml":
@@ -155,10 +163,6 @@ def load_non_pdf(file_path: str) -> List[Document]:
 
 # ---------------- PDF streaming (page-by-page) ----------------
 def iter_pdf_pages_as_documents(pdf_path: str) -> Iterable[Document]:
-    """
-    Stream pages from a PDF using PyMuPDF (fitz). Yields Document per page.
-    Avoids loading entire PDF text into memory.
-    """
     doc = fitz.open(pdf_path)
     try:
         for pno in range(doc.page_count):
@@ -180,14 +184,12 @@ def extract_and_load(file_path, archive_class):
             try:
                 archive.extractall(extract_dir)
             except Exception:
-                # fallback for py7zr differences
                 archive.extractall(path=extract_dir)
             for root, _, files in os.walk(extract_dir):
                 for file in files:
                     full_path = os.path.join(root, file)
                     ext = os.path.splitext(full_path)[1].lower()
                     if ext == ".pdf":
-                        # leave PDFs for streaming stage
                         docs.append(Document(page_content=f"[PDF IN ARCHIVE]: {full_path}", metadata={"path": full_path}))
                     else:
                         docs.extend(load_non_pdf(full_path))
@@ -228,23 +230,18 @@ def build_faiss_index_from_pdf(pdf_path: str,
 
             if split_chunks:
                 if faiss_index is None:
-                    logger.info("Creating initial FAISS index from %d chunks...", len(split_chunks))
                     faiss_index = FAISS.from_documents(split_chunks, embeddings)
                 else:
-                    logger.info("Adding %d chunks to FAISS index (total before add: %d).", len(split_chunks), total_chunks)
                     faiss_index.add_documents(split_chunks)
 
                 total_chunks += len(split_chunks)
-                logger.info("Total chunks so far: %d", total_chunks)
 
             batch_docs = []
             pages_in_batch = 0
 
             if total_chunks >= max_chunks:
-                logger.info("Reached max_chunks (%d) after adding batch. Ending.", max_chunks)
                 break
 
-    # final partial batch
     if pages_in_batch > 0 and total_chunks < max_chunks:
         split_chunks = splitter.split_documents(batch_docs)
         split_chunks = [c for c in split_chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
@@ -253,16 +250,12 @@ def build_faiss_index_from_pdf(pdf_path: str,
             split_chunks = split_chunks[:allowed]
         if split_chunks:
             if faiss_index is None:
-                logger.info("Creating FAISS index from final batch (%d chunks)...", len(split_chunks))
                 faiss_index = FAISS.from_documents(split_chunks, embeddings)
             else:
-                logger.info("Adding final %d chunks to FAISS index.", len(split_chunks))
                 faiss_index.add_documents(split_chunks)
             total_chunks += len(split_chunks)
-            logger.info("Final total chunks: %d", total_chunks)
 
     if faiss_index is None:
-        logger.warning("No text extracted from PDF; creating empty FAISS index.")
         faiss_index = FAISS.from_documents([Document(page_content="")], embeddings)
 
     return faiss_index
@@ -296,12 +289,10 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
     logger.info("📥 /hackrx/run request received for document: %s", data.documents)
 
     if not authorization or not authorization.startswith("Bearer "):
-        logger.error("❌ Missing or invalid Authorization header.")
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
 
     token = authorization.split("Bearer ")[1]
     if token != expected_token:
-        logger.error("❌ Invalid Bearer token.")
         raise HTTPException(status_code=403, detail="Invalid token.")
 
     tmp_path = None
@@ -309,10 +300,8 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         import time
         start_time = time.time()
 
-        logger.info("📄 Downloading document from: %s", data.documents)
         resp = requests.get(data.documents, stream=True, timeout=60)
         if resp.status_code != 200:
-            logger.error("❌ Failed to download document. HTTP %d", resp.status_code)
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
         content_type = resp.headers.get("content-type", "")
@@ -323,13 +312,11 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 if chunk:
                     tf.write(chunk)
             tmp_path = tf.name
-        logger.info("✅ Document saved to temporary path: %s", tmp_path)
 
         ext = os.path.splitext(tmp_path)[1].lower()
         vector_store = None
 
         if ext == ".pdf":
-            # Try to get page count quickly
             try:
                 pdf_doc = fitz.open(tmp_path)
                 page_count = pdf_doc.page_count
@@ -339,17 +326,14 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
             if page_count == 0:
                 chunk_size = 1000
+            elif page_count <= 10:
+                chunk_size = 600
+            elif page_count <= 200:
+                chunk_size = 1000
+            elif page_count <= 800:
+                chunk_size = 1200
             else:
-                if page_count <= 10:
-                    chunk_size = 600
-                elif page_count <= 200:
-                    chunk_size = 1000
-                elif page_count <= 800:
-                    chunk_size = 1200
-                else:
-                    chunk_size = 1500
-
-            logger.info("PDF detected (pages=%d). Using chunk_size=%d", page_count, chunk_size)
+                chunk_size = 1500
 
             vector_store = build_faiss_index_from_pdf(
                 pdf_path=tmp_path,
@@ -360,7 +344,6 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 max_chunks=MAX_CHUNKS
             )
         else:
-            # Non-pdf handling
             docs = []
             if ext in [".zip", ".rar", ".7z"]:
                 if ext == ".zip":
@@ -374,7 +357,6 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
             docs = [d for d in docs if d.page_content and len(d.page_content.strip()) >= MIN_CHUNK_LEN]
             if not docs:
-                logger.error("❌ No readable content found in non-pdf file.")
                 raise HTTPException(status_code=400, detail="No readable content found in document.")
 
             splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
@@ -382,9 +364,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             chunks = chunks[:MAX_CHUNKS]
             vector_store = FAISS.from_documents(chunks, embeddings)
 
-        # detect language from first stored chunk if possible
         try:
-            # FAISS stores docs in .docstore - access first stored doc content safely
             first_doc = None
             for k in vector_store.docstore._dict:
                 first_doc = vector_store.docstore._dict[k]
@@ -396,27 +376,20 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         except Exception:
             content_language = "unknown"
 
-        # Answer questions concurrently
         tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
-        # Log answers for Railway logs / debugging
-        for q, a in zip(data.questions, answers):
-            logger.info("----- QUESTION -----\n%s\n----- ANSWER -----\n%s\n", q, a)
-
         total_time = time.time() - start_time
-        logger.info("✅ Processing complete in %.2f seconds. Chunks indexed (approx cap %d).", total_time, MAX_CHUNKS)
+        logger.info("✅ Processing complete in %.2f seconds.", total_time)
 
         return {"answers": answers}
 
     except ValueError as ve:
-        logger.error("❌ %s", ve)
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         logger.exception("❌ Unexpected error: %s", e)
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
     finally:
-        # cleanup temp file
         try:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
