@@ -125,12 +125,7 @@ def load_non_pdf(file_path: str) -> List[Document]:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 html_content = f.read()
             soup = BeautifulSoup(html_content, "html.parser")
-
-            # 🚨 Ignore pages that look like secret-token or login pages
             text = soup.get_text(separator="\n", strip=True)
-            if "secret" in text.lower() and "token" in text.lower() and len(text) < 500:
-                raise ValueError("HTML page appears to be a token or non-document page.")
-
             return [Document(page_content=text)]
         elif ext in [".txt", ".md"]:
             return TextLoader(file_path).load()
@@ -262,13 +257,13 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
         content_type = resp.headers.get("content-type", "").split(";")[0]
+        # Allow HTML files instead of blocking secret-token pages
         if "text/html" in content_type.lower():
-            # 🚨 Stop processing HTML token pages
-            html_preview = resp.text[:500].lower()
-            if "secret" in html_preview and "token" in html_preview:
-                raise HTTPException(status_code=400, detail="URL points to a token HTML page, not a document.")
+            logger.info("📄 HTML document detected. Processing as HTML file.")
+            extension = ".html"
+        else:
+            extension = mimetypes.guess_extension(content_type) or os.path.splitext(data.documents)[1] or ".bin"
 
-        extension = mimetypes.guess_extension(content_type) or os.path.splitext(data.documents)[1] or ".bin"
         with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tf:
             for chunk in resp.iter_content(chunk_size=8192):
                 tf.write(chunk)
