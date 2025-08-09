@@ -6,8 +6,9 @@ import zipfile
 import mimetypes
 import pandas as pd
 from typing import List, Optional
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langdetect import detect  # ✅ Language detection
 
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -26,26 +27,18 @@ from langchain.document_loaders import (
 from PIL import Image
 import rarfile
 import py7zr
-import logging
 
-# Optional: prevent FAISS GPU warning on Railway
-import faiss
-if not hasattr(faiss, "GpuIndexIVFFlat"):
-    logging.warning("⚠ FAISS GPU not available. Using CPU-only FAISS.")
-
-# ---------------- Logging Config ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# ---------------- Load Environment ----------------
+# Load environment variables
 load_dotenv()
 
-# ---------------- Initialize FastAPI ----------------
+# Initialize FastAPI app
 app = FastAPI(
     title="HackRx Insurance Q&A API",
     description="Answer insurance-related questions using RAG and GPT",
     version="1.0.0"
 )
 
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -54,32 +47,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- Globals ----------------
+# Global variables
 vector_store = None
 qa_chain = None
+content_language = None  # ✅ Store document content language globally
 
-# ---------------- Question Classification ----------------
-def classify_question(question: str) -> str:
-    """Simple rule-based classification of insurance questions."""
-    q_lower = question.lower()
-    if "exclusion" in q_lower:
-        return "Policy Exclusion"
-    elif "renewal" in q_lower:
-        return "Policy Renewal"
-    elif "pre-existing" in q_lower or "ped" in q_lower:
-        return "Pre-Existing Condition"
-    elif "claim" in q_lower:
-        return "Claims Process"
-    elif "co-payment" in q_lower or "copay" in q_lower:
-        return "Payment Condition"
-    elif "coverage" in q_lower or "covered" in q_lower:
-        return "Coverage Details"
-    else:
-        return "General"
-
-# ---------------- Model Initialization ----------------
+# Model initialization
 try:
-    logging.info("🔍 Initializing models...")
+    print("🔍 Initializing models...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
         raise ValueError("OPENAI_API_KEY not set in environment variables.")
@@ -96,18 +71,21 @@ try:
     Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
     - Do not make assumptions.
     - Quote directly from the policy when possible.
+    - Reply in the same language as the question, which is {language}.
+
     Context:
     {context}
+
     Question: {input}
     Answer:
     """)
 
     qa_chain = create_stuff_documents_chain(llm, prompt)
-    logging.info("✅ Models initialized successfully.")
+    print("✅ Models initialized successfully.")
 except Exception as e:
-    logging.error(f"❌ Error initializing models: {e}")
+    print(f"❌ Error initializing models: {e}")
 
-# ---------------- Request Models ----------------
+# Request models
 class QuestionRequest(BaseModel):
     question: str
 
@@ -115,14 +93,15 @@ class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-# ---------------- Health Check ----------------
+# Health check
 @app.get("/")
 def health():
     return {"status": "API is running"}
 
-# ---------------- Ask Question Endpoint ----------------
+# Question answering route
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
+    global content_language
     if not vector_store or not qa_chain:
         raise HTTPException(status_code=500, detail="Model not loaded.")
 
@@ -130,21 +109,25 @@ def ask_question(request: QuestionRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    q_type = classify_question(question)
-    logging.info(f"📝 User Question: {question}")
-    logging.info(f"📌 Question Type: {q_type}")
+    # ✅ Detect question language
+    question_lang = detect(question)
 
     relevant_chunks = vector_store.similarity_search(question, k=12)
-    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
+    response = qa_chain.invoke({
+        "context": relevant_chunks,
+        "input": question,
+        "language": question_lang
+    })
 
     return {
         "question": question,
-        "question_type": q_type,
+        "question_language": question_lang,
+        "content_language": content_language,
         "answer": response,
         "source_chunks": [doc.page_content for doc in relevant_chunks]
     }
 
-# ---------------- Document Loader ----------------
+# Document loader
 def load_documents(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
 
@@ -192,7 +175,7 @@ def load_documents(file_path: str) -> List[Document]:
     except Exception as e:
         raise ValueError(f"Could not read file: {file_path} ({e})")
 
-# ---------------- Archive Extraction Helper ----------------
+# Helper: extract and load archives
 def extract_and_load(file_path, archive_class):
     docs = []
     with tempfile.TemporaryDirectory() as extract_dir:
@@ -204,25 +187,39 @@ def extract_and_load(file_path, archive_class):
                     try:
                         docs.extend(load_documents(full_path))
                     except Exception as e:
-                        logging.warning(f"⚠ Skipped file in archive: {file} ({e})")
+                        print(f"⚠ Skipped file in archive: {file} ({e})")
     return docs
 
-# ---------------- Async Answer ----------------
+# Async question answering
 async def ask_async(llm_chain, vector_store, question):
-    q_type = classify_question(question)
-    logging.info(f"📝 Async Question: {question}")
-    logging.info(f"📌 Question Type: {q_type}")
+    global content_language
+    lang_code = detect(question)
 
     rel_chunks = vector_store.similarity_search(question, k=12)
-    raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
+    raw = await llm_chain.ainvoke({
+        "context": rel_chunks,
+        "input": question,
+        "language": lang_code
+    })
     answer = raw.strip()
     if not answer or "i don't know" in answer.lower():
-        return "The policy document does not specify this clearly."
-    return answer
+        return {
+            "question": question,
+            "question_language": lang_code,
+            "content_language": content_language,
+            "answer": "The policy document does not specify this clearly."
+        }
+    return {
+        "question": question,
+        "question_language": lang_code,
+        "content_language": content_language,
+        "answer": answer
+    }
 
-# ---------------- HackRx Main Endpoint ----------------
+# Main HackRx API route
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
+    global content_language
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
@@ -234,7 +231,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         import time
         start_time = time.time()
 
-        logging.info(f"📄 Downloading document from: {data.documents}")
+        print(f"📄 Downloading document from: {data.documents}")
         response = requests.get(data.documents)
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to download document.")
@@ -251,6 +248,12 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
         if not docs:
             raise HTTPException(status_code=400, detail="No valid content found in document.")
+
+        # ✅ Detect content language from first large enough chunk
+        try:
+            content_language = detect(docs[0].page_content)
+        except:
+            content_language = "unknown"
 
         page_count = len(docs)
         chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
@@ -269,12 +272,9 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         answers = await asyncio.gather(*tasks)
 
         total_time = time.time() - start_time
-        logging.info(f"✅ Processed in {total_time:.2f} seconds.")
+        print(f"✅ Processed in {total_time:.2f} seconds.")
 
-        return {
-            "status": "success",
-            "answers": answers
-        }
+        return {"status": "success", "answers": answers}
 
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
