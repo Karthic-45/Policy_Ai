@@ -7,7 +7,7 @@ import zipfile
 import mimetypes
 import pandas as pd
 import logging
-import fitz  # PyMuPDF
+import fitz # PyMuPDF
 from typing import List, Optional, Iterable
 from langdetect import detect
 
