@@ -47,7 +47,7 @@ load_dotenv()
 app = FastAPI(
     title="HackRx Insurance Q&A API",
     description="Answer insurance-related questions using RAG and GPT",
-    version="1.0.2"
+    version="1.0.3"
 )
 
 # Enable CORS
@@ -164,23 +164,28 @@ def iter_pdf_pages_as_documents(pdf_path: str) -> Iterable[Document]:
     finally:
         doc.close()
 
-# ---------------- Archive extractor ----------------
-def extract_and_load(file_path, archive_class):
-    docs = []
-    with tempfile.TemporaryDirectory() as extract_dir:
-        with archive_class(file_path) as archive:
-            archive.extractall(extract_dir)
-            for root, _, files in os.walk(extract_dir):
-                for file in files:
-                    full_path = os.path.join(root, file)
-                    ext = os.path.splitext(full_path)[1].lower()
-                    if ext == ".pdf":
-                        docs.append(Document(page_content=f"[PDF IN ARCHIVE]: {full_path}", metadata={"path": full_path}))
-                    else:
-                        docs.extend(load_non_pdf(full_path))
-    return docs
+# ---------------- Extract city→landmark mapping ----------------
+def extract_city_landmark_mapping(pdf_path: str) -> dict:
+    text = ""
+    with fitz.open(pdf_path) as doc:
+        for page in doc:
+            text += page.get_text("text") + "\n"
 
-# ---------------- Incremental FAISS builder ----------------
+    # Pattern: icon (optional) + landmark name + city
+    pattern = re.compile(r"(?:[\W_]+)?([A-Za-z'’\s]+?)\s+([A-Za-z]+)$")
+    mapping = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "Landmark" in line or "Current Location" in line:
+            continue
+        match = pattern.search(line)
+        if match:
+            landmark = match.group(1).strip()
+            city = match.group(2).strip()
+            mapping[city] = landmark
+    return mapping
+
+# ---------------- FAISS index builder ----------------
 def build_faiss_index_from_pdf(pdf_path: str, embeddings, chunk_size: int = 1200) -> FAISS:
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=CHUNK_OVERLAP)
     faiss_index = None
@@ -238,23 +243,6 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         return "The policy document does not specify this clearly."
     return answer
 
-# ---------------- Puzzle parsing helpers ----------------
-KNOWN_LANDMARKS = ["Gateway of India","India Gate","Charminar","Marina Beach","Howrah Bridge","Golconda Fort","Qutub Minar","Taj Mahal","Meenakshi Temple","Lotus Temple","Mysore Palace","Rock Garden","Victoria Memorial","Vidhana Soudha","Sun Temple","Golden Temple","Eiffel Tower","Statue of Liberty","Big Ben","Colosseum","Sydney Opera House"]
-
-def fuzzy_match_city(fav_city: str, mapping: dict) -> Optional[str]:
-    fav_clean = fav_city.lower().replace(" ", "")
-    best_match = None
-    best_score = 0
-    for city_key, landmark_val in mapping.items():
-        key_clean = city_key.lower().replace(" ", "")
-        ratio = SequenceMatcher(None, fav_clean, key_clean).ratio()
-        if ratio > best_score:
-            best_score = ratio
-            best_match = landmark_val
-    if best_score >= 0.7:
-        return best_match
-    return None
-
 # ---------------- Main Endpoint ----------------
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
@@ -277,16 +265,32 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
         # Puzzle handling
         if ext.lower() == ".pdf":
-            mapping = {}  # <-- insert your mapping extraction here
-            fav_city = None  # <-- fetch from API
-            if mapping and fav_city:
-                lm = fuzzy_match_city(fav_city, mapping)
-                if lm:
-                    endpoint = "/teams/public/flights/getFifthCityFlightNumber"  # adjust mapping
-                    r = requests.get("https://register.hackrx.in" + endpoint, timeout=15)
+            mapping = extract_city_landmark_mapping(tmp_path)
+            logger.info("Detected city->landmark mapping: %s", mapping)
+
+            fav_city_resp = requests.get("https://register.hackrx.in/submissions/myFavouriteCity", timeout=10)
+            if fav_city_resp.ok:
+                fav_city = fav_city_resp.json().get("data")
+                logger.info("Favourite city from API: %s", fav_city)
+
+                if fav_city in mapping:
+                    landmark = mapping[fav_city]
+                    logger.info("Matched landmark for %s: %s", fav_city, landmark)
+
+                    if landmark == "Gateway of India":
+                        endpoint = "/teams/public/flights/getFirstCityFlightNumber"
+                    elif landmark == "Taj Mahal":
+                        endpoint = "/teams/public/flights/getSecondCityFlightNumber"
+                    elif landmark == "Eiffel Tower":
+                        endpoint = "/teams/public/flights/getThirdCityFlightNumber"
+                    elif landmark == "Big Ben":
+                        endpoint = "/teams/public/flights/getFourthCityFlightNumber"
+                    else:
+                        endpoint = "/teams/public/flights/getFifthCityFlightNumber"
+
+                    r = requests.get(f"https://register.hackrx.in{endpoint}", timeout=15)
                     if r.ok:
-                        jr = r.json()
-                        fn = jr.get("data", {}).get("flightNumber")
+                        fn = r.json().get("data", {}).get("flightNumber")
                         if fn:
                             return {"answers": [fn]}
 
