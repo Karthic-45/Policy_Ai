@@ -2,24 +2,29 @@ import os
 import tempfile
 import asyncio
 import requests
+import zipfile
+import mimetypes
+import pandas as pd
 from typing import List, Optional
+
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
+from langchain.schema import Document
 from langchain.document_loaders import (
     PyMuPDFLoader, UnstructuredFileLoader, TextLoader,
     UnstructuredEmailLoader, UnstructuredImageLoader
 )
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import zipfile
-import mimetypes
-import pandas as pd
-from langchain.schema import Document
+
+from PIL import Image
+import rarfile
+import py7zr
 
 # Load environment variables
 load_dotenv()
@@ -103,7 +108,6 @@ def ask_question(request: QuestionRequest):
         "source_chunks": [doc.page_content for doc in relevant_chunks]
     }
 
-# Universal document loader with fallback
 def load_documents(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
 
@@ -116,11 +120,26 @@ def load_documents(file_path: str) -> List[Document]:
             return TextLoader(file_path).load()
         elif ext == ".eml":
             return UnstructuredEmailLoader(file_path).load()
-        elif ext in [".png", ".jpg", ".jpeg"]:
-            return UnstructuredImageLoader(file_path).load()
+        elif ext in [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff"]:
+            # Try extracting text if possible, else return metadata
+            try:
+                return UnstructuredImageLoader(file_path).load()
+            except Exception:
+                with Image.open(file_path) as img:
+                    info = f"Image: format={img.format}, size={img.size}, mode={img.mode}"
+                return [Document(page_content=info)]
         elif ext == ".csv":
             df = pd.read_csv(file_path)
             return [Document(page_content=df.to_string())]
+        elif ext == ".xlsx":
+            try:
+                df = pd.read_excel(file_path)
+                return [Document(page_content=df.to_string())]
+            except Exception:
+                with open(file_path, "rb") as f:
+                    raw = f.read()
+                hex_preview = raw[:512].hex()
+                return [Document(page_content=f"[BINARY XLSX FILE PREVIEW - first 512 bytes in hex]: {hex_preview}")]
         elif ext == ".zip":
             docs = []
             with tempfile.TemporaryDirectory() as extract_dir:
@@ -134,8 +153,40 @@ def load_documents(file_path: str) -> List[Document]:
                             except Exception as e:
                                 print(f"⚠ Skipped file in ZIP: {file} ({e})")
             return docs
+        elif ext == ".rar":
+            docs = []
+            with tempfile.TemporaryDirectory() as extract_dir:
+                try:
+                    with rarfile.RarFile(file_path) as rar_ref:
+                        rar_ref.extractall(extract_dir)
+                        for root, _, files in os.walk(extract_dir):
+                            for file in files:
+                                full_path = os.path.join(root, file)
+                                try:
+                                    docs.extend(load_documents(full_path))
+                                except Exception as e:
+                                    print(f"⚠ Skipped file in RAR: {file} ({e})")
+                except rarfile.BadRarFile as e:
+                    raise ValueError(f"Invalid RAR file: {file_path} ({e})")
+            return docs
+        elif ext == ".7z":
+            docs = []
+            with tempfile.TemporaryDirectory() as extract_dir:
+                try:
+                    with py7zr.SevenZipFile(file_path, mode='r') as archive:
+                        archive.extractall(path=extract_dir)
+                        for root, _, files in os.walk(extract_dir):
+                            for file in files:
+                                full_path = os.path.join(root, file)
+                                try:
+                                    docs.extend(load_documents(full_path))
+                                except Exception as e:
+                                    print(f"⚠ Skipped file in 7z: {file} ({e})")
+                except Exception as e:
+                    raise ValueError(f"Invalid 7z file: {file_path} ({e})")
+            return docs
         else:
-            # Fallback for .bin or unknown formats
+            # Fallback for unknown or binary formats
             with open(file_path, "rb") as f:
                 raw_data = f.read()
 
@@ -153,7 +204,6 @@ def load_documents(file_path: str) -> List[Document]:
     except Exception as e:
         raise ValueError(f"Could not read file: {file_path} ({e})")
 
-# Async task handler
 async def ask_async(llm_chain, vector_store, question):
     rel_chunks = vector_store.similarity_search(question, k=12)
     raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
@@ -207,10 +257,10 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         chunks = splitter.split_documents(docs)
         chunks = chunks[:300]
 
-        # FAISS
+        # FAISS vector store
         temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
 
-        # Q&A
+        # Q&A tasks
         tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
