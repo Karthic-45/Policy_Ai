@@ -1,20 +1,17 @@
 fastapi
-uvicorn[standard]
+uvicorn
 python-dotenv
-python-multipart
-langchain==0.2.0
-langchain-core==0.2.0
-langchain-openai==0.2.0
-langchain-community==0.2.0
-openai>=1.14.0
-faiss-cpu>=1.7.4
-pymupdf>=1.23.1
-pydantic==1.10.9
-tiktoken
-scikit-learn
-python-magic
+pydantic
+pandas
+python-magic-bin; sys_platform == 'win32'
+python-magic; sys_platform != 'win32'
 pytesseract
-Pillow
-pdf2image
-
-
+pillow
+rarfile
+requests
+langchain
+langchain-openai
+langchain-community
+PyMuPDF
+unstructured
+faiss-cpu
