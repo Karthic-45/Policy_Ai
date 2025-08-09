@@ -1,13 +1,33 @@
-fastapi==0.95.2
-uvicorn[standard]==0.22.0
-python-dotenv==1.0.0
-requests==2.31.0
-langchain==0.0.263
-langchain-openai==0.3.29
-langchain-community==0.0.33
-pydantic==1.10.12
-pandas==2.0.3
-PyMuPDF==1.22.5
-unstructured==0.7.8
-python-multipart==0.0.6
-aiofiles==23.1.0
+# --- Core Backend Framework ---
+fastapi
+uvicorn[standard]
+
+# --- LangChain & AI Integrations ---
+# The core framework and integrations with OpenAI and Community models/loaders
+langchain>=0.2.0
+langchain-community
+langchain-openai
+
+# --- Local Embeddings & Model Handling ---
+# PyTorch and sentence-transformers are the foundation for HuggingFace embeddings
+torch
+sentence-transformers
+# Accelerate helps optimize model loading, especially from Hugging Face
+accelerate
+
+# --- Document Processing ---
+# PyMuPDF is for PDF files, docx2txt is for .docx files
+PyMuPDF
+docx2txt
+
+# --- Vector Store ---
+# GPU-optimized version of Facebook's similarity search library
+faiss-gpu
+
+# --- Utilities ---
+# For handling environment variables
+python-dotenv
+# For making HTTP requests to download documents
+requests
+# For token counting with OpenAI models
+tiktoken
