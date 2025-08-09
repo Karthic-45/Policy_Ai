@@ -1,28 +1,15 @@
-# --- Core Backend ---
 fastapi
-uvicorn[standard]
-
-# --- LangChain Core + OpenAI Support ---
-langchain>=0.2.0
-langchain-core
-langchain-openai
-langchain-community
-openai
-
-# --- Embeddings & Vector Store (CPU version) ---
-faiss-cpu
-tiktoken
-scikit-learn
-
-# --- File Handling ---
-PyMuPDF            # PDF
-python-docx        # DOCX
-python-multipart   # ZIP, File Uploads
-docx2txt           # Optional: extra text extraction from DOCX
-pandas             # CSV
-json5              # JSON with comments/flexibility
-
-# --- Utilities ---
-pydantic
+uvicorn
 python-dotenv
+langchain
+langchain-openai
+faiss-cpu
+pydantic
 requests
+PyMuPDF
+unstructured
+unstructured_email_extractor
+unstructured_image_loader
+pandas
+filetype
+python-magic
