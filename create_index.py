@@ -1,8 +1,8 @@
 import os
 import re
 import glob
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import OpenAIEmbeddings
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from PyPDF2 import PdfReader
@@ -38,7 +38,6 @@ def extract_text_from_txt(path):
         return f.read()
 
 def heading_aware_chunking(text):
-    # Split by headings (e.g., ALL CAPS or numbered headings)
     heading_pattern = r"(^[A-Z\s\d\.,\-:]{3,}$)|(^\d+(\.\d+)*\s.+$)"
     lines = text.splitlines()
 
@@ -64,7 +63,6 @@ def heading_aware_chunking(text):
             metadata={"heading": current_heading}
         ))
 
-    # Determine dynamic chunk size (500 to 1500 chars)
     avg_len = sum(len(d.page_content) for d in chunks) / max(1, len(chunks))
     chunk_size = max(500, min(1500, int(avg_len * 1.2)))
 
@@ -79,21 +77,18 @@ def heading_aware_chunking(text):
 def load_all_documents():
     all_docs = []
 
-    # PDFs
     pdf_files = glob.glob(os.path.join(PDF_FOLDER, "*.pdf"))
     for f in pdf_files:
         print(f"Loading PDF: {f}")
         text = extract_text_from_pdf(f)
         all_docs.append(text)
 
-    # DOCX
     docx_files = glob.glob(os.path.join(DOCX_FOLDER, "*.docx"))
     for f in docx_files:
         print(f"Loading DOCX: {f}")
         text = extract_text_from_docx(f)
         all_docs.append(text)
 
-    # TXT
     txt_files = glob.glob(os.path.join(TXT_FOLDER, "*.txt"))
     for f in txt_files:
         print(f"Loading TXT: {f}")
