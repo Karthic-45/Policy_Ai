@@ -6,29 +6,21 @@ uvicorn[standard]
 python-dotenv
 
 # --- LangChain Core ---
-langchain>=0.2.0
-langchain-core>=0.3.0
-langchain-openai>=0.1.7
-langchain-community>=0.0.36
+langchain
+langchain-core
+langchain-openai
+langchain-community
 
-# --- OpenAI ---
+# --- Embeddings and Vector DB ---
 openai
-
-# --- Vector Store ---
 faiss-cpu
 
-# --- PDF / DOCX / PPTX / XLSX / CSV Handling ---
+# --- PDF Loading and Data Handling ---
 PyMuPDF
-pandas
-python-docx
-python-pptx
-openpyxl
+pydantic
 
-# --- Token Counting ---
+# --- Token Counting (for OpenAI models) ---
 tiktoken
 
 # --- Cosine Similarity ---
 scikit-learn
-
-# --- File Type Detection ---
-python-magic
