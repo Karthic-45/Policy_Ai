@@ -69,7 +69,7 @@ try:
         raise ValueError("OPENAI_API_KEY not set in environment variables.")
     os.environ["OPENAI_API_KEY"] = openai_api_key
 
-    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
+    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
     chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
 
     embeddings = OpenAIEmbeddings(model=embedding_model_name)
@@ -107,7 +107,7 @@ class HackRxRequest(BaseModel):
 def health():
     return {"status": "API is running"}
 
-# Question answering route
+# Question answering route (manual test)
 @app.post("/ask")
 def ask_question(request: QuestionRequest):
     global content_language
@@ -135,10 +135,7 @@ def ask_question(request: QuestionRequest):
     logger.info(f"✅ Answer generated for the question.")
     return {
         "question": question,
-        "question_language": question_lang,
-        "content_language": content_language,
-        "answer": response,
-        "source_chunks": [doc.page_content for doc in relevant_chunks]
+        "answer": response
     }
 
 # Document loader
@@ -212,7 +209,8 @@ async def ask_async(llm_chain, vector_store, question):
     lang_code = detect(question)
     logger.info(f"🔎 Processing async question: {question} | Language: {lang_code}")
 
-    rel_chunks = vector_store.similarity_search(question, k=12)
+    # Get top 8 relevant chunks for speed
+    rel_chunks = vector_store.similarity_search(question, k=8)
     raw = await llm_chain.ainvoke({
         "context": rel_chunks,
         "input": question,
@@ -221,19 +219,9 @@ async def ask_async(llm_chain, vector_store, question):
     answer = raw.strip()
     if not answer or "i don't know" in answer.lower():
         logger.info("⚠ Model could not find a confident answer.")
-        return {
-            "question": question,
-            "question_language": lang_code,
-            "content_language": content_language,
-            "answer": "The policy document does not specify this clearly."
-        }
+        return "The policy document does not specify this clearly."
     logger.info("✅ Answer generated successfully.")
-    return {
-        "question": question,
-        "question_language": lang_code,
-        "content_language": content_language,
-        "answer": answer
-    }
+    return answer
 
 # Main HackRx API route
 @app.post("/hackrx/run")
@@ -285,8 +273,14 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             content_language = "unknown"
             logger.warning("⚠ Could not detect document language.")
 
+        # Dynamic chunk size based on doc length
         page_count = len(docs)
-        chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
+        if page_count <= 5:
+            chunk_size = 600
+        elif page_count <= 50:
+            chunk_size = 1000
+        else:
+            chunk_size = 1500
         logger.info(f"✂ Splitting into chunks with size: {chunk_size}")
 
         splitter = RecursiveCharacterTextSplitter(
@@ -295,10 +289,10 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             separators=["\n\n", "\n", ".", " "]
         )
         chunks = splitter.split_documents(docs)
-        chunks = chunks[:300]
+        chunks = chunks[:500]  # Limit for performance
         logger.info(f"📦 Created {len(chunks)} chunks for vector store.")
 
-        temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
+        temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-3-small"))
 
         tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
@@ -306,7 +300,8 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         total_time = time.time() - start_time
         logger.info(f"✅ Processing complete in {total_time:.2f} seconds.")
 
-        return {"status": "success", "answers": answers}
+        # Return only answers array
+        return {"answers": answers}
 
     except ValueError as ve:
         logger.error(f"❌ {ve}")
