@@ -14,6 +14,7 @@ langchain-community
 # --- Embeddings and Vector DB ---
 openai
 faiss-cpu
+pandas
 
 # --- PDF Loading and Data Handling ---
 PyMuPDF
