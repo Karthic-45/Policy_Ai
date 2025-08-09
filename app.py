@@ -35,7 +35,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 # ------------------------------------------------
 
 # Load environment variables
