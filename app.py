@@ -6,7 +6,8 @@ import zipfile
 import mimetypes
 import pandas as pd
 import logging
-from typing import List, Optional
+import fitz  # PyMuPDF
+from typing import List, Optional, Iterable
 from langdetect import detect
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -21,7 +22,7 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
 from langchain.schema import Document
 from langchain.document_loaders import (
-    PyMuPDFLoader, UnstructuredFileLoader, TextLoader,
+    UnstructuredFileLoader, TextLoader,
     UnstructuredEmailLoader, UnstructuredImageLoader
 )
 
@@ -34,7 +35,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 # ------------------------------------------------
 
 # Load environment variables
@@ -44,7 +45,7 @@ load_dotenv()
 app = FastAPI(
     title="HackRx Insurance Q&A API",
     description="Answer insurance-related questions using RAG and GPT",
-    version="1.0.0"
+    version="1.0.1"
 )
 
 # Enable CORS
@@ -56,10 +57,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables
-vector_store = None
+# Global variables (kept minimal)
 qa_chain = None
 content_language = None
+
+# Configurable defaults
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
+BATCH_SIZE_PAGES = int(os.getenv("BATCH_SIZE_PAGES", "25"))
+MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "2500"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "50"))
 
 # Model initialization
 try:
@@ -69,30 +77,28 @@ try:
         raise ValueError("OPENAI_API_KEY not set in environment variables.")
     os.environ["OPENAI_API_KEY"] = openai_api_key
 
-    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-    chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
-
-    embeddings = OpenAIEmbeddings(model=embedding_model_name)
-    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.1)
 
     prompt = PromptTemplate.from_template("""
-    You are an expert assistant in insurance policy analysis.
-    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
-    - Do not make assumptions.
-    - Quote directly from the policy when possible.
-    - Reply in the same language as the question, which is {language}.
+You are an expert assistant in insurance policy analysis.
+Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible.
+- Do not make assumptions.
+- Quote directly from the policy when possible.
+- Reply in the same language as the question, which is {language}.
 
-    Context:
-    {context}
+Context:
+{context}
 
-    Question: {input}
-    Answer:
-    """)
+Question: {input}
+Answer:
+""")
 
     qa_chain = create_stuff_documents_chain(llm, prompt)
     logger.info("✅ Models initialized successfully.")
 except Exception as e:
-    logger.error(f"❌ Error initializing models: {e}")
+    logger.exception("❌ Error initializing models: %s", e)
+    raise
 
 # Request models
 class QuestionRequest(BaseModel):
@@ -107,46 +113,11 @@ class HackRxRequest(BaseModel):
 def health():
     return {"status": "API is running"}
 
-# Question answering route (manual test)
-@app.post("/ask")
-def ask_question(request: QuestionRequest):
-    global content_language
-    if not vector_store or not qa_chain:
-        logger.error("Model not loaded before /ask request")
-        raise HTTPException(status_code=500, detail="Model not loaded.")
-
-    question = request.question.strip()
-    if not question:
-        logger.warning("Empty question received")
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    question_lang = detect(question)
-    logger.info(f"📥 Received question: {question} | Language: {question_lang}")
-
-    relevant_chunks = vector_store.similarity_search(question, k=12)
-    logger.info(f"🔍 Found {len(relevant_chunks)} relevant chunks for the question.")
-
-    response = qa_chain.invoke({
-        "context": relevant_chunks,
-        "input": question,
-        "language": question_lang
-    })
-
-    logger.info(f"✅ Answer generated for the question.")
-    return {
-        "question": question,
-        "answer": response
-    }
-
-# Document loader
-def load_documents(file_path: str) -> List[Document]:
+# ---------------- Utility loaders (non-PDF) ----------------
+def load_non_pdf(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
-    logger.info(f"📂 Loading file: {file_path} | Extension: {ext}")
-
     try:
-        if ext == ".pdf":
-            return PyMuPDFLoader(file_path).load()
-        elif ext in [".doc", ".docx", ".pptx", ".html", ".htm"]:
+        if ext in [".doc", ".docx", ".pptx", ".html", ".htm"]:
             return UnstructuredFileLoader(file_path).load()
         elif ext in [".txt", ".md"]:
             return TextLoader(file_path).load()
@@ -169,13 +140,7 @@ def load_documents(file_path: str) -> List[Document]:
             except Exception:
                 with open(file_path, "rb") as f:
                     raw = f.read()
-                return [Document(page_content=f"[BINARY XLSX FILE PREVIEW]: {raw[:512].hex()}")]
-        elif ext == ".zip":
-            return extract_and_load(file_path, zipfile.ZipFile)
-        elif ext == ".rar":
-            return extract_and_load(file_path, rarfile.RarFile)
-        elif ext == ".7z":
-            return extract_and_load(file_path, py7zr.SevenZipFile)
+                return [Document(page_content=f"[BINARY XLSX PREVIEW]: {raw[:512].hex()}")]
         else:
             with open(file_path, "rb") as f:
                 raw_data = f.read()
@@ -185,51 +150,150 @@ def load_documents(file_path: str) -> List[Document]:
                 decoded = raw_data.decode("latin-1", errors="ignore")
             return [Document(page_content=decoded)]
     except Exception as e:
-        logger.error(f"❌ Could not read file {file_path}: {e}")
-        raise ValueError(f"Could not read file: {file_path} ({e})")
+        logger.warning("Non-PDF loader failed for %s: %s", file_path, e)
+        return []
 
-# Helper: extract and load archives
+# ---------------- PDF streaming (page-by-page) ----------------
+def iter_pdf_pages_as_documents(pdf_path: str) -> Iterable[Document]:
+    """
+    Stream pages from a PDF using PyMuPDF (fitz). Yields Document per page.
+    Avoids loading entire PDF text into memory.
+    """
+    doc = fitz.open(pdf_path)
+    try:
+        for pno in range(doc.page_count):
+            page = doc.load_page(pno)
+            text = page.get_text("text") or ""
+            text = text.strip()
+            if not text:
+                continue
+            meta = {"page": pno + 1, "source": os.path.basename(pdf_path)}
+            yield Document(page_content=text, metadata=meta)
+    finally:
+        doc.close()
+
+# ---------------- Archive extractor ----------------
 def extract_and_load(file_path, archive_class):
     docs = []
     with tempfile.TemporaryDirectory() as extract_dir:
         with archive_class(file_path) as archive:
-            archive.extractall(extract_dir)
+            try:
+                archive.extractall(extract_dir)
+            except Exception:
+                # fallback for py7zr differences
+                archive.extractall(path=extract_dir)
             for root, _, files in os.walk(extract_dir):
                 for file in files:
                     full_path = os.path.join(root, file)
-                    try:
-                        docs.extend(load_documents(full_path))
-                    except Exception as e:
-                        logger.warning(f"⚠ Skipped file in archive: {file} ({e})")
+                    ext = os.path.splitext(full_path)[1].lower()
+                    if ext == ".pdf":
+                        # leave PDFs for streaming stage
+                        docs.append(Document(page_content=f"[PDF IN ARCHIVE]: {full_path}", metadata={"path": full_path}))
+                    else:
+                        docs.extend(load_non_pdf(full_path))
     return docs
 
-# Async question answering
-async def ask_async(llm_chain, vector_store, question):
-    global content_language
-    lang_code = detect(question)
-    logger.info(f"🔎 Processing async question: {question} | Language: {lang_code}")
+# ---------------- Incremental FAISS builder ----------------
+def build_faiss_index_from_pdf(pdf_path: str,
+                               embeddings,
+                               chunk_size: int = 1200,
+                               chunk_overlap: int = CHUNK_OVERLAP,
+                               batch_pages: int = BATCH_SIZE_PAGES,
+                               max_chunks: int = MAX_CHUNKS) -> FAISS:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ".", " "]
+    )
 
-    # Get top 8 relevant chunks for speed
-    rel_chunks = vector_store.similarity_search(question, k=8)
-    raw = await llm_chain.ainvoke({
-        "context": rel_chunks,
+    faiss_index = None
+    total_chunks = 0
+    batch_docs: List[Document] = []
+    pages_in_batch = 0
+
+    for page_doc in iter_pdf_pages_as_documents(pdf_path):
+        pages_in_batch += 1
+        batch_docs.append(page_doc)
+
+        if pages_in_batch >= batch_pages:
+            split_chunks = splitter.split_documents(batch_docs)
+            split_chunks = [c for c in split_chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
+
+            allowed = max_chunks - total_chunks
+            if allowed <= 0:
+                logger.info("Reached max_chunks cap (%d). Stopping indexing.", max_chunks)
+                break
+            if len(split_chunks) > allowed:
+                split_chunks = split_chunks[:allowed]
+
+            if split_chunks:
+                if faiss_index is None:
+                    logger.info("Creating initial FAISS index from %d chunks...", len(split_chunks))
+                    faiss_index = FAISS.from_documents(split_chunks, embeddings)
+                else:
+                    logger.info("Adding %d chunks to FAISS index (total before add: %d).", len(split_chunks), total_chunks)
+                    faiss_index.add_documents(split_chunks)
+
+                total_chunks += len(split_chunks)
+                logger.info("Total chunks so far: %d", total_chunks)
+
+            batch_docs = []
+            pages_in_batch = 0
+
+            if total_chunks >= max_chunks:
+                logger.info("Reached max_chunks (%d) after adding batch. Ending.", max_chunks)
+                break
+
+    # final partial batch
+    if pages_in_batch > 0 and total_chunks < max_chunks:
+        split_chunks = splitter.split_documents(batch_docs)
+        split_chunks = [c for c in split_chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
+        allowed = max_chunks - total_chunks
+        if len(split_chunks) > allowed:
+            split_chunks = split_chunks[:allowed]
+        if split_chunks:
+            if faiss_index is None:
+                logger.info("Creating FAISS index from final batch (%d chunks)...", len(split_chunks))
+                faiss_index = FAISS.from_documents(split_chunks, embeddings)
+            else:
+                logger.info("Adding final %d chunks to FAISS index.", len(split_chunks))
+                faiss_index.add_documents(split_chunks)
+            total_chunks += len(split_chunks)
+            logger.info("Final total chunks: %d", total_chunks)
+
+    if faiss_index is None:
+        logger.warning("No text extracted from PDF; creating empty FAISS index.")
+        faiss_index = FAISS.from_documents([Document(page_content="")], embeddings)
+
+    return faiss_index
+
+# ---------------- Async QA helper ----------------
+async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
+    try:
+        lang = detect(question)
+    except Exception:
+        lang = "en"
+    top_k = 6
+    docs = vector_store.similarity_search(question, k=top_k)
+    if not docs:
+        return "The policy document does not specify this clearly."
+    raw = await chain.ainvoke({
+        "context": docs,
         "input": question,
-        "language": lang_code
+        "language": lang
     })
     answer = raw.strip()
     if not answer or "i don't know" in answer.lower():
-        logger.info("⚠ Model could not find a confident answer.")
         return "The policy document does not specify this clearly."
-    logger.info("✅ Answer generated successfully.")
     return answer
 
-# Main HackRx API route
+# ---------------- Main /hackrx/run endpoint ----------------
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     global content_language
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
 
-    logger.info("📥 /hackrx/run request received.")
+    logger.info("📥 /hackrx/run request received for document: %s", data.documents)
 
     if not authorization or not authorization.startswith("Bearer "):
         logger.error("❌ Missing or invalid Authorization header.")
@@ -240,72 +304,121 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         logger.error("❌ Invalid Bearer token.")
         raise HTTPException(status_code=403, detail="Invalid token.")
 
+    tmp_path = None
     try:
         import time
         start_time = time.time()
 
-        logger.info(f"📄 Downloading document from: {data.documents}")
-        response = requests.get(data.documents)
-        if response.status_code != 200:
-            logger.error(f"❌ Failed to download document. HTTP {response.status_code}")
+        logger.info("📄 Downloading document from: %s", data.documents)
+        resp = requests.get(data.documents, stream=True, timeout=60)
+        if resp.status_code != 200:
+            logger.error("❌ Failed to download document. HTTP %d", resp.status_code)
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
-        mime_type = response.headers.get("content-type", "")
-        extension = mimetypes.guess_extension(mime_type) or ".bin"
+        content_type = resp.headers.get("content-type", "")
+        extension = mimetypes.guess_extension(content_type.split(";")[0]) or os.path.splitext(data.documents)[1] or ".bin"
 
-        with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tmp:
-            tmp.write(response.content)
-            tmp_path = tmp.name
-        logger.info(f"✅ Document saved to temporary path: {tmp_path}")
+        with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tf:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    tf.write(chunk)
+            tmp_path = tf.name
+        logger.info("✅ Document saved to temporary path: %s", tmp_path)
 
-        docs = load_documents(tmp_path)
-        docs = [doc for doc in docs if len(doc.page_content.strip()) > 100]
-        logger.info(f"📄 Loaded {len(docs)} documents after filtering.")
+        ext = os.path.splitext(tmp_path)[1].lower()
+        vector_store = None
 
-        if not docs:
-            logger.error("❌ No valid content found in document.")
-            raise HTTPException(status_code=400, detail="No valid content found in document.")
+        if ext == ".pdf":
+            # Try to get page count quickly
+            try:
+                pdf_doc = fitz.open(tmp_path)
+                page_count = pdf_doc.page_count
+                pdf_doc.close()
+            except Exception:
+                page_count = 0
 
-        try:
-            content_language = detect(docs[0].page_content)
-            logger.info(f"🌐 Detected document language: {content_language}")
-        except:
-            content_language = "unknown"
-            logger.warning("⚠ Could not detect document language.")
+            if page_count == 0:
+                chunk_size = 1000
+            else:
+                if page_count <= 10:
+                    chunk_size = 600
+                elif page_count <= 200:
+                    chunk_size = 1000
+                elif page_count <= 800:
+                    chunk_size = 1200
+                else:
+                    chunk_size = 1500
 
-        # Dynamic chunk size based on doc length
-        page_count = len(docs)
-        if page_count <= 5:
-            chunk_size = 600
-        elif page_count <= 50:
-            chunk_size = 1000
+            logger.info("PDF detected (pages=%d). Using chunk_size=%d", page_count, chunk_size)
+
+            vector_store = build_faiss_index_from_pdf(
+                pdf_path=tmp_path,
+                embeddings=embeddings,
+                chunk_size=chunk_size,
+                chunk_overlap=CHUNK_OVERLAP,
+                batch_pages=BATCH_SIZE_PAGES,
+                max_chunks=MAX_CHUNKS
+            )
         else:
-            chunk_size = 1500
-        logger.info(f"✂ Splitting into chunks with size: {chunk_size}")
+            # Non-pdf handling
+            docs = []
+            if ext in [".zip", ".rar", ".7z"]:
+                if ext == ".zip":
+                    docs = extract_and_load(tmp_path, zipfile.ZipFile)
+                elif ext == ".rar":
+                    docs = extract_and_load(tmp_path, rarfile.RarFile)
+                else:
+                    docs = extract_and_load(tmp_path, py7zr.SevenZipFile)
+            else:
+                docs = load_non_pdf(tmp_path)
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=100,
-            separators=["\n\n", "\n", ".", " "]
-        )
-        chunks = splitter.split_documents(docs)
-        chunks = chunks[:500]  # Limit for performance
-        logger.info(f"📦 Created {len(chunks)} chunks for vector store.")
+            docs = [d for d in docs if d.page_content and len(d.page_content.strip()) >= MIN_CHUNK_LEN]
+            if not docs:
+                logger.error("❌ No readable content found in non-pdf file.")
+                raise HTTPException(status_code=400, detail="No readable content found in document.")
 
-        temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-3-small"))
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
+            chunks = splitter.split_documents(docs)
+            chunks = chunks[:MAX_CHUNKS]
+            vector_store = FAISS.from_documents(chunks, embeddings)
 
-        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
+        # detect language from first stored chunk if possible
+        try:
+            # FAISS stores docs in .docstore - access first stored doc content safely
+            first_doc = None
+            for k in vector_store.docstore._dict:
+                first_doc = vector_store.docstore._dict[k]
+                break
+            if first_doc and first_doc.page_content:
+                content_language = detect(first_doc.page_content)
+            else:
+                content_language = "unknown"
+        except Exception:
+            content_language = "unknown"
+
+        # Answer questions concurrently
+        tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
-        total_time = time.time() - start_time
-        logger.info(f"✅ Processing complete in {total_time:.2f} seconds.")
+        # Log answers for Railway logs / debugging
+        for q, a in zip(data.questions, answers):
+            logger.info("----- QUESTION -----\n%s\n----- ANSWER -----\n%s\n", q, a)
 
-        # Return only answers array
+        total_time = time.time() - start_time
+        logger.info("✅ Processing complete in %.2f seconds. Chunks indexed (approx cap %d).", total_time, MAX_CHUNKS)
+
         return {"answers": answers}
 
     except ValueError as ve:
-        logger.error(f"❌ {ve}")
+        logger.error("❌ %s", ve)
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        logger.error(f"❌ Unexpected error: {e}")
+        logger.exception("❌ Unexpected error: %s", e)
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+    finally:
+        # cleanup temp file
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
