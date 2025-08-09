@@ -16,4 +16,3 @@ scikit-learn
 rarfile
 py7zr
 Pillow
-beautifulsoup4
