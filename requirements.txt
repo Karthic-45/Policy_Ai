@@ -6,7 +6,7 @@ uvicorn[standard]
 python-dotenv
 
 # --- LangChain Core ---
-langchain
+langchain>=0.2.0
 langchain-core
 langchain-openai
 langchain-community
