@@ -2,23 +2,37 @@ import os
 import tempfile
 import asyncio
 import requests
+import mimetypes
 from typing import List, Optional
+
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
-from langchain.document_loaders import PyMuPDFLoader
+
+from langchain_community.document_loaders import (
+    PyMuPDFLoader,
+    UnstructuredFileLoader,
+    TextLoader,
+    UnstructuredEmailLoader,
+    UnstructuredImageLoader,
+)
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+import zipfile
+import pandas as pd
+
+# Load env vars
 load_dotenv()
 
 app = FastAPI(
     title="HackRx Insurance Q&A API",
-    description="Answer insurance-related questions using RAG and GPT",
+    description="Answer insurance questions via RAG + GPT",
     version="1.0.0"
 )
 
@@ -30,23 +44,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-vector_store = None
-qa_chain = None
+# Globals - set in startup
+embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
+chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
+openai_api_key = os.getenv("OPENAI_API_KEY")
+bearer_token = os.getenv("HACKRX_BEARER_TOKEN")
 
-try:
-    print("🔍 Initializing models...")
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    os.environ["OPENAI_API_KEY"] = openai_api_key
+if not openai_api_key:
+    raise RuntimeError("OPENAI_API_KEY environment variable is missing!")
 
-    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
-    chat_model_name = os.getenv("CHAT_MODEL", "gpt-4")
+os.environ["OPENAI_API_KEY"] = openai_api_key
 
-    embeddings = OpenAIEmbeddings(model=embedding_model_name)
-    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
+embeddings = OpenAIEmbeddings(model=embedding_model_name)
+llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
 
-    prompt = PromptTemplate.from_template("""
+prompt_template = """
 You are an expert assistant in insurance policy analysis.
-Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
+Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible.
 - Do not make assumptions.
 - Quote directly from the policy when possible.
 
@@ -55,104 +69,125 @@ Context:
 
 Question: {input}
 Answer:
-""")
+"""
 
-    qa_chain = create_stuff_documents_chain(llm, prompt)
-    print("✅ Models initialized.")
-
-    # Load FAISS index
-    INDEX_PATH = "faiss_index"
-    vector_store = FAISS.load_local(INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
-    print("✅ FAISS index loaded successfully.")
-
-except Exception as e:
-    print(f"❌ Error initializing models or loading index: {e}")
-    vector_store = None
-    qa_chain = None
+prompt = PromptTemplate.from_template(prompt_template)
+qa_chain = create_stuff_documents_chain(llm, prompt)
 
 class QuestionRequest(BaseModel):
     question: str
 
 class HackRxRequest(BaseModel):
-    documents: str
+    documents: str  # URL to document
     questions: List[str]
 
 @app.get("/")
-def health():
+def health_check():
     return {"status": "API is running"}
 
-@app.post("/ask")
-def ask_question(request: QuestionRequest):
-    if not vector_store or not qa_chain:
-        raise HTTPException(status_code=500, detail="Models or index not loaded.")
+# Universal loader for many filetypes
+def load_documents(file_path: str) -> List:
+    ext = os.path.splitext(file_path)[1].lower()
 
-    question = request.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    if ext == ".pdf":
+        return PyMuPDFLoader(file_path).load()
+    elif ext in [".doc", ".docx", ".pptx", ".html", ".htm"]:
+        return UnstructuredFileLoader(file_path).load()
+    elif ext in [".txt", ".md"]:
+        return TextLoader(file_path).load()
+    elif ext == ".eml":
+        return UnstructuredEmailLoader(file_path).load()
+    elif ext in [".png", ".jpg", ".jpeg"]:
+        return UnstructuredImageLoader(file_path).load()
+    elif ext == ".csv":
+        df = pd.read_csv(file_path)
+        return [Document(page_content=df.to_string())]
+    elif ext == ".zip":
+        docs = []
+        with tempfile.TemporaryDirectory() as extract_dir:
+            with zipfile.ZipFile(file_path, "r") as zip_ref:
+                zip_ref.extractall(extract_dir)
+                for root, _, files in os.walk(extract_dir):
+                    for f in files:
+                        try:
+                            docs.extend(load_documents(os.path.join(root, f)))
+                        except Exception as e:
+                            print(f"⚠️ Skipped file in ZIP: {f} ({e})")
+        return docs
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}")
 
-    relevant_chunks = vector_store.similarity_search(question, k=12)
-    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
-
-    return {
-        "question": question,
-        "answer": response,
-        "source_chunks": [doc.page_content for doc in relevant_chunks]
-    }
-
-async def ask_async(llm_chain, vector_store, question):
-    rel_chunks = vector_store.similarity_search(question, k=12)
-    raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
+async def ask_async(chain, vectorstore, question):
+    relevant_chunks = vectorstore.similarity_search(question, k=12)
+    raw = await chain.ainvoke({"context": relevant_chunks, "input": question})
     answer = raw.strip()
     if not answer or "i don't know" in answer.lower():
         return "The policy document does not specify this clearly."
     return answer
 
 @app.post("/hackrx/run")
-async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
-    expected_token = os.getenv("HACKRX_BEARER_TOKEN")
+async def hackrx_run(
+    data: HackRxRequest, authorization: Optional[str] = Header(None)
+):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
     token = authorization.split("Bearer ")[1]
-    if token != expected_token:
+    if token != bearer_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
 
     try:
         import time
         start_time = time.time()
 
-        # Download document from URL
-        response = requests.get(data.documents)
-        if response.status_code != 200:
+        # Download document
+        resp = requests.get(data.documents)
+        if resp.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(response.content)
+        # Guess extension from content-type or fallback to .bin
+        mime_type = resp.headers.get("content-type", "")
+        ext = mimetypes.guess_extension(mime_type) or ".bin"
+
+        # Save temp file
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(resp.content)
             tmp_path = tmp.name
 
-        loader = PyMuPDFLoader(tmp_path)
-        docs = loader.load()
-        docs = [doc for doc in docs if len(doc.page_content.strip()) > 200]
+        # Load docs (supports pdf, docx, zip, etc)
+        docs = load_documents(tmp_path)
+        docs = [d for d in docs if len(d.page_content.strip()) > 200]
 
-        page_count = len(docs)
-        chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
+        if not docs:
+            raise HTTPException(status_code=400, detail="No valid content found in document.")
+
+        # Determine chunk size dynamically based on doc length
+        doc_len = len(docs)
+        if doc_len <= 5:
+            chunk_size = 600
+        elif doc_len <= 10:
+            chunk_size = 800
+        else:
+            chunk_size = 1000
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=100,
-            separators=["\n\n", "\n", ".", " "]
+            separators=["\n\n", "\n", ".", " "],
         )
         chunks = splitter.split_documents(docs)
-        chunks = chunks[:300]
+        chunks = chunks[:300]  # limit max chunks
 
-        temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
+        # Create FAISS index
+        vector_store = FAISS.from_documents(chunks, embeddings)
 
-        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
+        # Run async queries
+        tasks = [ask_async(qa_chain, vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
         total_time = time.time() - start_time
-        print(f"⏱️ Total Time: {total_time:.2f} sec")
+        print(f"⏱ Total Time: {total_time:.2f} seconds")
 
         return {"status": "success", "answers": answers}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing request: {e}")
