@@ -12,9 +12,9 @@ from langdetect import detect
 from bs4 import BeautifulSoup
 
 # ---------------- Force FAISS to CPU-only before importing ----------------
-os.environ["FAISS_NO_GPU"] = "1"            # Don't try GPU
-os.environ["FAISS_DISABLE_AVX512"] = "1"    # Disable AVX512 entirely
-os.environ["FAISS_DISABLE_AVX512_SPR"] = "1"  # Disable SPR AVX512
+os.environ["FAISS_NO_GPU"] = "1"
+os.environ["FAISS_DISABLE_AVX512"] = "1"
+os.environ["FAISS_DISABLE_AVX512_SPR"] = "1"
 
 import faiss
 try:
@@ -48,7 +48,7 @@ import py7zr
 # ---------------- Logging Setup ----------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -251,7 +251,9 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     global content_language
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
-    logger.info("📥 /hackrx/run request received for document: %s", data.documents)
+
+    logger.info("📥 /hackrx/run request received.")
+    logger.info(f"📄 Downloading document from: {data.documents}")
 
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
@@ -261,13 +263,14 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
     tmp_path = None
     try:
         start_time = asyncio.get_event_loop().time()
+
+        # Download document
         resp = requests.get(data.documents, stream=True, timeout=60)
         if resp.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
         content_type = resp.headers.get("content-type", "").split(";")[0]
         if "text/html" in content_type.lower():
-            logger.info("📄 HTML document detected. Processing as HTML file.")
             extension = ".html"
         else:
             extension = mimetypes.guess_extension(content_type) or os.path.splitext(data.documents)[1] or ".bin"
@@ -276,8 +279,10 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             for chunk in resp.iter_content(chunk_size=8192):
                 tf.write(chunk)
             tmp_path = tf.name
+        logger.info(f"✅ Document saved to temporary path: {tmp_path}")
 
         ext = os.path.splitext(tmp_path)[1].lower()
+        logger.info(f"📂 Loading file: {tmp_path} | Extension: {ext}")
         vector_store = None
 
         if ext == ".pdf":
@@ -286,7 +291,10 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             except Exception:
                 page_count = 0
             chunk_size = 600 if page_count <= 10 else 1000 if page_count <= 200 else 1200 if page_count <= 800 else 1500
-            vector_store = build_faiss_index_from_pdf(tmp_path, embeddings, chunk_size, CHUNK_OVERLAP, BATCH_SIZE_PAGES, MAX_CHUNKS)
+            logger.info(f"✂ Splitting into chunks with size: {chunk_size}")
+            vector_store = build_faiss_index_from_pdf(
+                tmp_path, embeddings, chunk_size, CHUNK_OVERLAP, BATCH_SIZE_PAGES, MAX_CHUNKS
+            )
         else:
             docs = []
             if ext in [".zip", ".rar", ".7z"]:
@@ -298,10 +306,15 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                     docs = extract_and_load(tmp_path, py7zr.SevenZipFile)
             else:
                 docs = load_non_pdf(tmp_path)
+
             docs = [d for d in docs if d.page_content and len(d.page_content.strip()) >= MIN_CHUNK_LEN]
+            logger.info(f"📄 Loaded {len(docs)} documents after filtering.")
+
             if not docs:
                 raise HTTPException(status_code=400, detail="No readable content found in document.")
+
             chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP).split_documents(docs)[:MAX_CHUNKS]
+            logger.info(f"📦 Created {len(chunks)} chunks for vector store.")
             vector_store = FAISS.from_documents(chunks, embeddings)
 
         try:
@@ -309,10 +322,20 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             content_language = detect(first_doc.page_content) if first_doc and first_doc.page_content else "unknown"
         except Exception:
             content_language = "unknown"
+        logger.info(f"🌐 Detected document language: {content_language}")
 
-        answers = await asyncio.gather(*[ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions])
-        logger.info("✅ Processing complete in %.2f seconds.", asyncio.get_event_loop().time() - start_time)
+        # Process each question
+        answers = []
+        for q in data.questions:
+            logger.info(f"🔎 Processing async question: {q.strip()} | Language: {content_language}")
+            ans = await ask_async_chain(qa_chain, vector_store, q.strip())
+            answers.append(ans)
+
+        elapsed_time = asyncio.get_event_loop().time() - start_time
+        logger.info(f"✅ Processing complete in {elapsed_time:.2f} seconds.")
+
         return {"answers": answers}
+
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
