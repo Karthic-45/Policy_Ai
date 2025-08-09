@@ -1,29 +1,37 @@
 import os
 import tempfile
+import asyncio
 import requests
-from typing import List
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import (
-    PyMuPDFLoader, 
-    Docx2txtLoader, 
-    CSVLoader, 
-    JSONLoader, 
-    UnstructuredFileLoader
-)
-from langchain.docstore.document import Document
 from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import PromptTemplate
+from langchain.schema import Document
+from langchain.document_loaders import PyMuPDFLoader, TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import zipfile
+import mimetypes
+import pandas as pd
+import docx
+import pptx
+import magic
 
-load_dotenv()  # Loads .env if running locally; Railway uses actual env vars
+# Load environment variables
+load_dotenv()
 
-app = FastAPI()
+# Initialize FastAPI app
+app = FastAPI(
+    title="HackRx Insurance Q&A API",
+    description="Answer insurance-related questions using RAG and GPT",
+    version="1.0.0"
+)
 
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,79 +40,202 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class QueryRequest(BaseModel):
+# Global models
+vector_store = None
+qa_chain = None
+try:
+    print("\U0001F50D Initializing models...")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    os.environ["OPENAI_API_KEY"] = openai_api_key
+
+    embedding_model_name = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
+    chat_model_name = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
+
+    embeddings = OpenAIEmbeddings(model=embedding_model_name)
+    llm = ChatOpenAI(model_name=chat_model_name, temperature=0.1)
+
+    prompt = PromptTemplate.from_template("""
+    You are an expert assistant in insurance policy analysis.
+    Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible. 
+    - Do not make assumptions.
+    - Quote directly from the policy when possible.
+
+    Context:
+    {context}
+
+    Question: {input}
+    Answer:
+    """)
+
+    qa_chain = create_stuff_documents_chain(llm, prompt)
+    print("✅ Models initialized.")
+except Exception as e:
+    print(f"❌ Error initializing models: {e}")
+
+# Request models
+class QuestionRequest(BaseModel):
+    question: str
+
+class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
+# Health check route
+@app.get("/")
+def health():
+    return {"status": "API is running"}
+
+@app.post("/ask")
+def ask_question(request: QuestionRequest):
+    if not vector_store or not qa_chain:
+        raise HTTPException(status_code=500, detail="Model not loaded.")
+
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    relevant_chunks = vector_store.similarity_search(question, k=12)
+    response = qa_chain.invoke({"context": relevant_chunks, "input": question})
+
+    return {
+        "question": question,
+        "answer": response,
+        "source_chunks": [doc.page_content for doc in relevant_chunks]
+    }
+
+# Universal document loader
 def load_documents(file_path: str) -> List[Document]:
-    ext = os.path.splitext(file_path)[-1].lower()
+    ext = os.path.splitext(file_path)[1].lower()
 
-    if ext == ".pdf":
-        return PyMuPDFLoader(file_path).load()
-    elif ext == ".docx":
-        return Docx2txtLoader(file_path).load()
-    elif ext == ".csv":
-        return CSVLoader(file_path).load()
-    elif ext == ".json":
-        return JSONLoader(file_path).load()
-    elif ext == ".zip":
-        return UnstructuredFileLoader(file_path).load()
-    elif ext in [".txt", ".md", ".html", ".pptx", ".xlsx"]:
-        return UnstructuredFileLoader(file_path).load()
-    elif ext == ".bin":
-        try:
-            with open(file_path, "rb") as f:
-                raw_data = f.read()
-            try:
-                text = raw_data.decode("utf-8", errors="ignore")
-            except UnicodeDecodeError:
-                text = raw_data.hex()
-            return [Document(page_content=text, metadata={"source": file_path})]
-        except Exception as e:
-            raise ValueError(f"Failed to load .bin file: {e}")
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
+    try:
+        if ext == ".pdf":
+            return PyMuPDFLoader(file_path).load()
 
-async def download_file(url: str) -> str:
-    response = requests.get(url, stream=True)
-    if response.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Failed to download file: {url}")
-    
-    suffix = os.path.splitext(url)[-1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-        for chunk in response.iter_content(chunk_size=8192):
-            tmp_file.write(chunk)
-        return tmp_file.name
+        elif ext == ".docx":
+            doc = docx.Document(file_path)
+            text = "\n".join(p.text for p in doc.paragraphs)
+            return [Document(page_content=text)]
+
+        elif ext == ".pptx":
+            prs = pptx.Presentation(file_path)
+            text_runs = []
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if hasattr(shape, "text"):
+                        text_runs.append(shape.text)
+            return [Document(page_content="\n".join(text_runs))]
+
+        elif ext in [".txt", ".md"]:
+            return TextLoader(file_path).load()
+
+        elif ext == ".csv":
+            df = pd.read_csv(file_path, dtype=str, encoding_errors="ignore")
+            return [Document(page_content=df.to_string())]
+
+        elif ext == ".xlsx":
+            df = pd.read_excel(file_path, dtype=str)
+            return [Document(page_content=df.to_string())]
+
+        elif ext == ".zip":
+            docs = []
+            with tempfile.TemporaryDirectory() as extract_dir:
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+                for root, _, files in os.walk(extract_dir):
+                    for f in files:
+                        docs.extend(load_documents(os.path.join(root, f)))
+            return docs
+
+        else:
+            mime_type = magic.from_file(file_path, mime=True)
+
+            if mime_type.startswith("text/"):
+                with open(file_path, "r", errors="ignore") as f:
+                    return [Document(page_content=f.read())]
+
+            elif mime_type.startswith("image/"):
+                return [Document(page_content=f"[Image file: {os.path.basename(file_path)}]")]
+
+            elif mime_type in ["application/octet-stream"]:
+                return [Document(page_content=f"[Binary file: {os.path.basename(file_path)}]")]
+
+            else:
+                return [Document(page_content=f"[Unsupported file type: {mime_type}]")]
+
+    except Exception as e:
+        print(f"⚠ Error loading {file_path}: {e}")
+        return []
+
+# Async task handler
+async def ask_async(llm_chain, vector_store, question):
+    rel_chunks = vector_store.similarity_search(question, k=12)
+    raw = await llm_chain.ainvoke({"context": rel_chunks, "input": question})
+    answer = raw.strip()
+    if not answer or "i don't know" in answer.lower():
+        return "The policy document does not specify this clearly."
+    return answer
 
 @app.post("/hackrx/run")
-async def run_query(request: QueryRequest, authorization: str = Header(None)):
+async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
-    if authorization != f"Bearer {expected_token}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = authorization.split("Bearer ")[1]
+    if token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid token.")
 
-    # Download & load document
-    file_path = await download_file(request.documents)
-    all_docs = load_documents(file_path)
+    try:
+        import time
+        start_time = time.time()
 
-    # Embeddings & FAISS vector store using your EMBEDDING_MODEL env variable
-    embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
-    embeddings = OpenAIEmbeddings(model=embedding_model)
-    vectorstore = FAISS.from_documents(all_docs, embeddings)
-    retriever = vectorstore.as_retriever()
+        # Download file
+        response = requests.get(data.documents)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to download document.")
 
-    # LLM using your CHAT_MODEL env variable (default gpt-3.5-turbo)
-    chat_model = os.getenv("CHAT_MODEL", "gpt-4")
-    llm = ChatOpenAI(model=chat_model, temperature=0)
+        # Guess extension
+        mime_type = response.headers.get("content-type", "")
+        extension = mimetypes.guess_extension(mime_type) or ".bin"
 
-    prompt = ChatPromptTemplate.from_template(
-        "Answer the question based on the documents:\n\n{context}\n\nQuestion: {question}"
-    )
-    chain = create_stuff_documents_chain(llm, prompt)
+        with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tmp:
+            tmp.write(response.content)
+            tmp_path = tmp.name
 
-    results = []
-    for question in request.questions:
-        retrieved_docs = retriever.get_relevant_documents(question)
-        answer = chain.run({"context": retrieved_docs, "question": question})
-        results.append({"question": question, "answer": answer})
+        # Load documents
+        docs = load_documents(tmp_path)
+        docs = [doc for doc in docs if len(doc.page_content.strip()) > 50]
 
-    return {"status": "success", "results": results}
+        if not docs:
+            raise HTTPException(status_code=400, detail="No valid content found in document.")
+
+        # Chunking
+        page_count = len(docs)
+        chunk_size = 600 if page_count <= 5 else 800 if page_count <= 10 else 1000
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ".", " "]
+        )
+        chunks = splitter.split_documents(docs)
+        chunks = chunks[:300]
+
+        # FAISS
+        temp_vector_store = FAISS.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-ada-002"))
+
+        # Q&A
+        tasks = [ask_async(qa_chain, temp_vector_store, q.strip()) for q in data.questions]
+        answers = await asyncio.gather(*tasks)
+
+        total_time = time.time() - start_time
+        print(f"⏱ Total Time: {total_time:.2f} sec")
+
+        return {
+            "status": "success",
+            "answers": answers
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
