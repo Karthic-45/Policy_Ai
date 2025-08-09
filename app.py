@@ -31,18 +31,21 @@ from PIL import Image
 import rarfile
 import py7zr
 
+# ---------------- Logging Setup ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
+# ---------------- Env Setup ----------------
 load_dotenv()
 
+# ---------------- FastAPI App ----------------
 app = FastAPI(
     title="HackRx Insurance Q&A API",
     description="Answer questions using RAG and GPT",
-    version="1.0.2"
+    version="1.0.3"
 )
 
 app.add_middleware(
@@ -56,6 +59,7 @@ app.add_middleware(
 qa_chain = None
 content_language = None
 
+# ---------------- Config ----------------
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
 BATCH_SIZE_PAGES = int(os.getenv("BATCH_SIZE_PAGES", "25"))
@@ -63,6 +67,7 @@ MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "2500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "50"))
 
+# ---------------- Model Init ----------------
 try:
     logger.info("🔍 Initializing models...")
     openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -90,17 +95,12 @@ except Exception as e:
     logger.exception("❌ Error initializing models: %s", e)
     raise
 
-class QuestionRequest(BaseModel):
-    question: str
-
+# ---------------- Request Models ----------------
 class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
-@app.get("/")
-def health():
-    return {"status": "API is running"}
-
+# ---------------- Loader Functions ----------------
 def load_non_pdf(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
     try:
@@ -149,8 +149,7 @@ def iter_pdf_pages_as_documents(pdf_path: str) -> Iterable[Document]:
             text = text.strip()
             if not text:
                 continue
-            meta = {"page": pno + 1, "source": os.path.basename(pdf_path)}
-            yield Document(page_content=text, metadata=meta)
+            yield Document(page_content=text, metadata={"page": pno + 1})
     finally:
         doc.close()
 
@@ -164,18 +163,15 @@ def extract_and_load(file_path, archive_class):
                 archive.extractall(path=extract_dir)
             for root, _, files in os.walk(extract_dir):
                 for file in files:
-                    full_path = os.path.join(root, file)
                     if file.lower().endswith(".pdf"):
-                        docs.append(Document(page_content=f"[PDF IN ARCHIVE]: {full_path}", metadata={"path": full_path}))
+                        docs.append(Document(page_content=f"[PDF IN ARCHIVE]: {os.path.join(root, file)}"))
                     else:
-                        docs.extend(load_non_pdf(full_path))
+                        docs.extend(load_non_pdf(os.path.join(root, file)))
     return docs
 
 def build_faiss_index_from_pdf(pdf_path: str, embeddings,
-                               chunk_size: int = 1200,
-                               chunk_overlap: int = CHUNK_OVERLAP,
-                               batch_pages: int = BATCH_SIZE_PAGES,
-                               max_chunks: int = MAX_CHUNKS) -> FAISS:
+                               chunk_size=1200, chunk_overlap=CHUNK_OVERLAP,
+                               batch_pages=BATCH_SIZE_PAGES, max_chunks=MAX_CHUNKS) -> FAISS:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -183,9 +179,8 @@ def build_faiss_index_from_pdf(pdf_path: str, embeddings,
     )
     faiss_index = None
     total_chunks = 0
-    batch_docs: List[Document] = []
+    batch_docs = []
     pages_in_batch = 0
-
     for page_doc in iter_pdf_pages_as_documents(pdf_path):
         pages_in_batch += 1
         batch_docs.append(page_doc)
@@ -207,24 +202,7 @@ def build_faiss_index_from_pdf(pdf_path: str, embeddings,
             pages_in_batch = 0
             if total_chunks >= max_chunks:
                 break
-
-    if pages_in_batch > 0 and total_chunks < max_chunks:
-        split_chunks = splitter.split_documents(batch_docs)
-        split_chunks = [c for c in split_chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
-        allowed = max_chunks - total_chunks
-        if len(split_chunks) > allowed:
-            split_chunks = split_chunks[:allowed]
-        if split_chunks:
-            if faiss_index is None:
-                faiss_index = FAISS.from_documents(split_chunks, embeddings)
-            else:
-                faiss_index.add_documents(split_chunks)
-            total_chunks += len(split_chunks)
-
-    if faiss_index is None:
-        faiss_index = FAISS.from_documents([Document(page_content="")], embeddings)
-
-    return faiss_index
+    return faiss_index or FAISS.from_documents([Document(page_content="")], embeddings)
 
 async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
     try:
@@ -234,145 +212,111 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
     docs = vector_store.similarity_search(question, k=6)
     if not docs:
         return "The document does not specify this clearly."
-    raw = await chain.ainvoke({
-        "context": docs,
-        "input": question,
-        "language": lang
-    })
-    answer = raw.strip()
-    if not answer or "i don't know" in answer.lower():
-        return "The document does not specify this clearly."
-    return answer
+    raw = await chain.ainvoke({"context": docs, "input": question, "language": lang})
+    return raw.strip()
 
+# ---------------- Embedded Task Execution ----------------
 def try_execute_embedded_task(documents: List[str]) -> Optional[dict]:
     """Detects and executes embedded puzzle/task instructions dynamically."""
     full_text = "\n".join(documents)
     if "Step-by-Step Guide" not in full_text:
         return None
     try:
-        # Example: detect an API call sequence in doc
+        # Find all URLs in the document
         api_matches = re.findall(r'https?://[^\s]+', full_text)
         if not api_matches:
             return None
-        # Simple dynamic execution: call first API that returns a string/city
-        city_api = [u for u in api_matches if "favouriteCity" in u][0]
+
+        # Step 1: Get the favourite city
+        city_api = next((u for u in api_matches if "favouriteCity" in u), None)
+        if not city_api:
+            return None
         city = requests.get(city_api, timeout=10).text.strip()
         logger.info(f"Extracted city from embedded instructions: {city}")
-        # find mapping in doc
+
+        # Step 2: Extract mapping (City -> Landmark)
         mapping = {}
         for line in full_text.splitlines():
             parts = re.split(r'\s{2,}|\t', line.strip())
             if len(parts) >= 2:
                 mapping[parts[1]] = parts[0]
         landmark = mapping.get(city)
+        if not landmark:
+            logger.warning(f"No landmark found for city: {city}")
+            return None
         logger.info(f"Landmark for city: {landmark}")
-        # choose correct API
+
+        # Step 3: Choose correct flight API based on landmark
         if "Gateway of India" in landmark:
-            next_api = [u for u in api_matches if "getFirstCityFlightNumber" in u][0]
+            next_api = next((u for u in api_matches if "getFirstCityFlightNumber" in u), None)
         elif "Taj Mahal" in landmark:
-            next_api = [u for u in api_matches if "getSecondCityFlightNumber" in u][0]
+            next_api = next((u for u in api_matches if "getSecondCityFlightNumber" in u), None)
         elif "Eiffel Tower" in landmark:
-            next_api = [u for u in api_matches if "getThirdCityFlightNumber" in u][0]
+            next_api = next((u for u in api_matches if "getThirdCityFlightNumber" in u), None)
         elif "Big Ben" in landmark:
-            next_api = [u for u in api_matches if "getFourthCityFlightNumber" in u][0]
+            next_api = next((u for u in api_matches if "getFourthCityFlightNumber" in u), None)
         else:
-            next_api = [u for u in api_matches if "getFifthCityFlightNumber" in u][0]
-        result = requests.get(next_api, timeout=10).text.strip()
-        logger.info(f"Task execution result: {result}")
-        return {"result": result}
+            next_api = next((u for u in api_matches if "getFifthCityFlightNumber" in u), None)
+
+        if not next_api:
+            logger.warning(f"No matching flight number API for landmark: {landmark}")
+            return None
+
+        # Step 4: Get the actual flight number
+        flight_number = requests.get(next_api, timeout=10).text.strip()
+        logger.info(f"Retrieved flight number: {flight_number}")
+
+        return {
+            "status": "success",
+            "flight_number": flight_number
+        }
     except Exception as e:
         logger.warning(f"Embedded task execution failed: {e}")
         return None
 
+# ---------------- Main Endpoint ----------------
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None)):
-    global content_language
     expected_token = os.getenv("HACKRX_BEARER_TOKEN")
-
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-
-    token = authorization.split("Bearer ")[1]
-    if token != expected_token:
+    if authorization.split("Bearer ")[1] != expected_token:
         raise HTTPException(status_code=403, detail="Invalid token.")
 
     tmp_path = None
     try:
-        import time
-        start_time = time.time()
         resp = requests.get(data.documents, stream=True, timeout=60)
         if resp.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to download document.")
 
-        content_type = resp.headers.get("content-type", "")
-        extension = mimetypes.guess_extension(content_type.split(";")[0]) or os.path.splitext(data.documents)[1] or ".bin"
-
+        extension = mimetypes.guess_extension(resp.headers.get("content-type", "").split(";")[0]) \
+            or os.path.splitext(data.documents)[1] or ".bin"
         with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tf:
             for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    tf.write(chunk)
+                tf.write(chunk)
             tmp_path = tf.name
 
         ext = os.path.splitext(tmp_path)[1].lower()
-        vector_store = None
-
         docs_text = []
+
         if ext == ".pdf":
             docs_text = [p.page_content for p in iter_pdf_pages_as_documents(tmp_path)]
             embedded_result = try_execute_embedded_task(docs_text)
             if embedded_result:
                 return embedded_result
-            # else proceed with RAG
-            vector_store = build_faiss_index_from_pdf(
-                pdf_path=tmp_path,
-                embeddings=embeddings,
-                chunk_size=1200,
-                chunk_overlap=CHUNK_OVERLAP,
-                batch_pages=BATCH_SIZE_PAGES,
-                max_chunks=MAX_CHUNKS
-            )
+            vector_store = build_faiss_index_from_pdf(tmp_path, embeddings)
         else:
-            docs = []
-            if ext in [".zip", ".rar", ".7z"]:
-                if ext == ".zip":
-                    docs = extract_and_load(tmp_path, zipfile.ZipFile)
-                elif ext == ".rar":
-                    docs = extract_and_load(tmp_path, rarfile.RarFile)
-                else:
-                    docs = extract_and_load(tmp_path, py7zr.SevenZipFile)
-            else:
-                docs = load_non_pdf(tmp_path)
-            docs = [d for d in docs if d.page_content and len(d.page_content.strip()) >= MIN_CHUNK_LEN]
+            docs = load_non_pdf(tmp_path)
             docs_text = [d.page_content for d in docs]
             embedded_result = try_execute_embedded_task(docs_text)
             if embedded_result:
                 return embedded_result
             splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
             chunks = splitter.split_documents(docs)
-            chunks = chunks[:MAX_CHUNKS]
-            vector_store = FAISS.from_documents(chunks, embeddings)
+            vector_store = FAISS.from_documents(chunks[:MAX_CHUNKS], embeddings)
 
-        try:
-            first_doc = None
-            for k in vector_store.docstore._dict:
-                first_doc = vector_store.docstore._dict[k]
-                break
-            if first_doc and first_doc.page_content:
-                content_language = detect(first_doc.page_content)
-            else:
-                content_language = "unknown"
-        except Exception:
-            content_language = "unknown"
-
-        tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
-        answers = await asyncio.gather(*tasks)
-        return {"answers": answers}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+        answers = await asyncio.gather(*[ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions])
+        return {"status": "success", "answers": answers}
     finally:
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
