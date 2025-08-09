@@ -1,289 +1,127 @@
-#!/usr/bin/env python3
-"""
-create_index.py
-
-Usage examples:
-  python create_index.py --input-folder ./policy_docs --index-path ./faiss_index
-  python create_index.py --input-file https://.../policy.pdf --index-path ./faiss_index
-
-Outputs:
-  - FAISS index files in --index-path
-  - metadata_map.json (maps chunk ids -> source/metadata)
-"""
-
 import os
 import re
-import json
-import tempfile
-import zipfile
-import mimetypes
-from pathlib import Path
-from typing import List, Dict, Tuple
-from dotenv import load_dotenv
-import argparse
-import logging
-
-# LangChain & OpenAI
-from langchain.schema import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
+import glob
 from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain.docstore.document import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from PyPDF2 import PdfReader
+from docx import Document as DocxDocument
 
-# Document loaders (try to import; if not installed, user must pip install proper packages)
-try:
-    from langchain_community.document_loaders import PyMuPDFLoader, UnstructuredPowerPointLoader, UnstructuredWordDocumentLoader, UnstructuredEmailLoader, UnstructuredImageLoader
-except Exception as e:
-    raise ImportError("Please install langchain-community and optional loader deps (unstructured, pymupdf). Error: %s" % e)
+# CONFIG
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    raise ValueError("Missing OPENAI_API_KEY in environment")
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("create_index")
+os.environ["OPENAI_API_KEY"] = openai_api_key
 
-# ---------- Utilities ----------
-def is_url(path: str) -> bool:
-    return path.startswith("http://") or path.startswith("https://")
+PDF_FOLDER = "./pdf_documents"
+DOCX_FOLDER = "./docx_documents"
+TXT_FOLDER = "./txt_documents"
+INDEX_PATH = "faiss_index"
 
-def download_to_temp(url: str) -> str:
-    import requests
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    suffix = mimetypes.guess_extension(r.headers.get("content-type", "")) or Path(url).suffix or ".bin"
-    tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tf.write(r.content)
-    tf.flush()
-    tf.close()
-    return tf.name
+def extract_text_from_pdf(path):
+    reader = PdfReader(path)
+    text = ""
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
+    return text
 
-def list_files_recursive(folder: str) -> List[str]:
-    files = []
-    for root, _, filenames in os.walk(folder):
-        for f in filenames:
-            files.append(os.path.join(root, f))
-    return files
+def extract_text_from_docx(path):
+    doc = DocxDocument(path)
+    return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
 
-# ---------- Loader ----------
-def load_documents_from_path(path: str) -> List[Document]:
-    """
-    Load a single file path (or downloaded URL) into langchain Documents.
-    Sets metadata['source'] to original path.
-    """
-    docs: List[Document] = []
-    orig_path = path
-    if is_url(path):
-        path = download_to_temp(path)
+def extract_text_from_txt(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
 
-    ext = Path(path).suffix.lower()
-    try:
-        if ext == ".pdf":
-            loader = PyMuPDFLoader(path)
-            docs = loader.load()
-        elif ext in [".doc", ".docx"]:
-            loader = UnstructuredWordDocumentLoader(path)
-            docs = loader.load()
-        elif ext in [".ppt", ".pptx"]:
-            loader = UnstructuredPowerPointLoader(path)
-            docs = loader.load()
-        elif ext in [".eml", ".msg"]:
-            loader = UnstructuredEmailLoader(path)
-            docs = loader.load()
-        elif ext in [".png", ".jpg", ".jpeg", ".bmp", ".tiff"]:
-            loader = UnstructuredImageLoader(path)
-            docs = loader.load()
-        elif ext == ".csv":
-            import pandas as pd
-            df = pd.read_csv(path)
-            docs = [Document(page_content=df.to_string(), metadata={"source": orig_path})]
-        elif ext == ".xlsx":
-            import pandas as pd
-            df = pd.read_excel(path)
-            docs = [Document(page_content=df.to_string(), metadata={"source": orig_path})]
-        elif ext == ".zip":
-            with tempfile.TemporaryDirectory() as extract_dir:
-                with zipfile.ZipFile(path, "r") as z:
-                    z.extractall(extract_dir)
-                for root, _, files in os.walk(extract_dir):
-                    for f in files:
-                        full = os.path.join(root, f)
-                        docs.extend(load_documents_from_path(full))
+def heading_aware_chunking(text):
+    # Split by headings (e.g., ALL CAPS or numbered headings)
+    heading_pattern = r"(^[A-Z\s\d\.,\-:]{3,}$)|(^\d+(\.\d+)*\s.+$)"
+    lines = text.splitlines()
+
+    chunks = []
+    current_heading = "General"
+    current_chunk = ""
+
+    for line in lines:
+        if re.match(heading_pattern, line.strip()):
+            if current_chunk.strip():
+                chunks.append(Document(
+                    page_content=f"[Heading: {current_heading}]\n{current_chunk.strip()}",
+                    metadata={"heading": current_heading}
+                ))
+                current_chunk = ""
+            current_heading = line.strip()
         else:
-            # fallback: attempt word then pdf then load raw text
-            try:
-                loader = UnstructuredWordDocumentLoader(path)
-                docs = loader.load()
-            except Exception:
-                try:
-                    loader = PyMuPDFLoader(path)
-                    docs = loader.load()
-                except Exception:
-                    try:
-                        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                            text = fh.read()
-                            docs = [Document(page_content=text, metadata={"source": orig_path})]
-                    except Exception as e:
-                        logger.warning(f"Could not load {path}: {e}")
-                        docs = []
-    except Exception as e:
-        logger.warning(f"Loader failure for {path}: {e}")
-        docs = []
+            current_chunk += " " + line.strip()
 
-    # Normalize metadata
-    for d in docs:
-        md = dict(d.metadata or {})
-        md["source"] = md.get("source", orig_path)
-        d.metadata = md
-    return docs
+    if current_chunk.strip():
+        chunks.append(Document(
+            page_content=f"[Heading: {current_heading}]\n{current_chunk.strip()}",
+            metadata={"heading": current_heading}
+        ))
 
-# ---------- Heading-aware structure split ----------
-HEADER_RE = re.compile(r"^\s*(?:section|clause|article|chapter|heading|part|section\s*\d+|[A-Z][A-Za-z0-9\s]{1,60})\s*[:\-\n]", re.I)
-NUMBERED_LINE = re.compile(r"^\s*(\d+[\.\)]|\(\d+\)|[ivx]+\.)\s+", re.I)
+    # Determine dynamic chunk size (500 to 1500 chars)
+    avg_len = sum(len(d.page_content) for d in chunks) / max(1, len(chunks))
+    chunk_size = max(500, min(1500, int(avg_len * 1.2)))
 
-def structure_aware_split(documents: List[Document], chunk_size: int, chunk_overlap: int) -> List[Document]:
-    """
-    Breaks documents into logical blocks by headings and blank lines, then uses a RecursiveCharacterTextSplitter.
-    Returns list[Document] with metadata including block_id and chunk_id.
-    """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ".", " ", ""]
-    )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=100)
+    final_chunks = []
+    for doc in chunks:
+        splits = splitter.split_text(doc.page_content)
+        final_chunks.extend([Document(page_content=part, metadata=doc.metadata) for part in splits])
 
-    blocks: List[Document] = []
-    for doc_idx, doc in enumerate(documents):
-        text = doc.page_content or ""
-        source = doc.metadata.get("source", f"doc_{doc_idx}")
-        # split by two or more newlines (paragraph/section separation)
-        raw_paras = re.split(r"\n{2,}", text)
-        block_id = 0
-        for para in raw_paras:
-            para = para.strip()
-            if not para:
-                continue
-            # If para contains heading markers near start, treat as a block boundary
-            lines = para.splitlines()
-            current_lines = []
-            for line in lines:
-                # treat heading or numbered bullet as block boundary
-                if HEADER_RE.match(line.strip()) or NUMBERED_LINE.match(line.strip()):
-                    if current_lines:
-                        block_text = "\n".join(current_lines).strip()
-                        if block_text:
-                            blocks.append(Document(page_content=block_text, metadata={**doc.metadata, "source": source, "block_id": str(block_id)}))
-                            block_id += 1
-                            current_lines = []
-                    current_lines.append(line)
-                else:
-                    current_lines.append(line)
-            if current_lines:
-                block_text = "\n".join(current_lines).strip()
-                if block_text:
-                    blocks.append(Document(page_content=block_text, metadata={**doc.metadata, "source": source, "block_id": str(block_id)}))
-                    block_id += 1
-
-    # Now split blocks into chunks
-    final_chunks: List[Document] = []
-    for b_idx, block in enumerate(blocks):
-        pieces = splitter.split_documents([block])
-        for i, piece in enumerate(pieces):
-            md = dict(piece.metadata or {})
-            md["block_id"] = md.get("block_id", str(b_idx))
-            md["chunk_id"] = f"{md['block_id']}_{i}"
-            final_chunks.append(Document(page_content=piece.page_content, metadata=md))
     return final_chunks
 
-# ---------- Adaptive chunking ----------
-def determine_chunk_params(documents: List[Document], target_max_chunks=300, model_context_tokens=8192) -> Tuple[int, int]:
-    total_chars = sum(len(d.page_content or "") for d in documents)
-    page_count = max(1, len(documents))
-    avg_chars_per_page = total_chars / page_count
+def load_all_documents():
+    all_docs = []
 
-    # base
-    if page_count <= 3:
-        base = 700
-    elif page_count <= 10:
-        base = 600
-    else:
-        base = 450
+    # PDFs
+    pdf_files = glob.glob(os.path.join(PDF_FOLDER, "*.pdf"))
+    for f in pdf_files:
+        print(f"Loading PDF: {f}")
+        text = extract_text_from_pdf(f)
+        all_docs.append(text)
 
-    if avg_chars_per_page > 3000:
-        base = min(base + 300, 1500)
-    elif avg_chars_per_page < 800:
-        base = max(base - 200, 300)
+    # DOCX
+    docx_files = glob.glob(os.path.join(DOCX_FOLDER, "*.docx"))
+    for f in docx_files:
+        print(f"Loading DOCX: {f}")
+        text = extract_text_from_docx(f)
+        all_docs.append(text)
 
-    est_chunks = max(1, total_chars // base)
-    if est_chunks > target_max_chunks:
-        base = int(total_chars / target_max_chunks) + 50
+    # TXT
+    txt_files = glob.glob(os.path.join(TXT_FOLDER, "*.txt"))
+    for f in txt_files:
+        print(f"Loading TXT: {f}")
+        text = extract_text_from_txt(f)
+        all_docs.append(text)
 
-    overlap = 150 if base <= 500 else 80 if base <= 900 else 50
-    return base, overlap
+    return all_docs
 
-# ---------- Build & Save FAISS ----------
-def build_faiss_index(documents: List[Document], index_path: str, embedding_model: str = "text-embedding-ada-002"):
-    if not documents:
-        raise ValueError("No documents to index.")
-    chunk_size, chunk_overlap = determine_chunk_params(documents)
-    logger.info(f"chunk_size={chunk_size}, overlap={chunk_overlap}, documents={len(documents)}")
-
-    logger.info("Structure-aware splitting...")
-    chunks = structure_aware_split(documents, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    # filter tiny chunks
-    chunks = [c for c in chunks if len((c.page_content or "").strip()) > 50]
-    logger.info(f"Total chunks after split/filter: {len(chunks)}")
-
-    embeddings = OpenAIEmbeddings(model=embedding_model)
-    logger.info("Creating FAISS vectorstore (this will batch embeddings automatically)...")
-    vector_store = FAISS.from_documents(chunks, embeddings)
-
-    os.makedirs(index_path, exist_ok=True)
-    vector_store.save_local(index_path)
-    logger.info(f"FAISS saved to {index_path}")
-
-    # Save chunk metadata mapping
-    meta_map = []
-    for c in chunks:
-        md = c.metadata or {}
-        meta_map.append({
-            "chunk_id": md.get("chunk_id"),
-            "block_id": md.get("block_id"),
-            "source": md.get("source"),
-            "excerpt": (c.page_content or "")[:800]
-        })
-    with open(os.path.join(index_path, "metadata_map.json"), "w", encoding="utf-8") as fh:
-        json.dump(meta_map, fh, indent=2)
-    logger.info("Saved metadata_map.json")
-    return vector_store
-
-# ---------- CLI ----------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input-folder", type=str, default=None, help="Folder containing files to index")
-    parser.add_argument("--input-file", type=str, default=None, help="Single file path or URL to index")
-    parser.add_argument("--index-path", type=str, default="faiss_index", help="Folder to save FAISS index")
-    parser.add_argument("--embedding-model", type=str, default=os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002"))
-    args = parser.parse_args()
+    texts = load_all_documents()
+    if not texts:
+        print("No documents found to index.")
+        return
 
-    sources = []
-    if args.input_folder:
-        sources = list_files_recursive(args.input_folder)
-    elif args.input_file:
-        sources = [args.input_file]
-    else:
-        raise SystemExit("Provide --input-folder or --input-file")
+    print("Chunking documents with heading awareness...")
+    all_chunks = []
+    for text in texts:
+        chunks = heading_aware_chunking(text)
+        all_chunks.extend(chunks)
 
-    all_docs: List[Document] = []
-    for s in sources:
-        try:
-            loaded = load_documents_from_path(s)
-            all_docs.extend(loaded)
-            logger.info(f"Loaded {len(loaded)} docs from {s}")
-        except Exception as e:
-            logger.warning(f"Error loading {s}: {e}")
+    print(f"Total chunks created: {len(all_chunks)}")
 
-    if not all_docs:
-        raise SystemExit("No documents loaded; aborting.")
+    print("Creating embeddings and building FAISS index...")
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_documents(all_chunks, embeddings)
 
-    build_faiss_index(all_docs, args.index_path, embedding_model=args.embedding_model)
-    logger.info("Indexing complete.")
+    vectorstore.save_local(INDEX_PATH)
+    print(f"FAISS index saved to: {INDEX_PATH}")
 
 if __name__ == "__main__":
     main()
