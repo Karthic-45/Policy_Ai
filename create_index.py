@@ -24,7 +24,7 @@ from langchain.schema import Document
 # ---------------------------
 # 1. Load environment variables
 # ---------------------------
-env_path = os.path.join(os.path.dirname(__file__), ".env")
+env_path = os.path.join(os.path.dirname(_file_), ".env")
 load_dotenv(dotenv_path=env_path)
 
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -161,7 +161,7 @@ def create_and_save_index(chunks, index_path):
 # ---------------------------
 # 8. Main
 # ---------------------------
-if __name__ == "__main__":
+if _name_ == "_main_":
     start_time = time.time()
 
     print("📄 Loading documents...")
@@ -178,4 +178,3 @@ if __name__ == "__main__":
         print("⚠ No documents found.")
 
     print(f"⏱ Done in {time.time() - start_time:.2f} seconds")
-
