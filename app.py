@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Full app.py for HackRx RAG backend (corrected)
+Full app.py for HackRx RAG backend (updated)
 - Handles PDFs, archives, JSON/text/HTML endpoints (e.g. get-secret-token)
 - Streams PDFs page-by-page to limit memory usage
 - Builds FAISS index (incremental for large PDFs)
@@ -50,18 +50,6 @@ from langchain.document_loaders import (
     UnstructuredFileLoader, TextLoader,
     UnstructuredEmailLoader, UnstructuredImageLoader
 )
-import re
-
-FLIGHT_REGEX = re.compile(r"\b[A-Z]{2}\d{3,4}\b")
-
-def extract_flight_number_from_docs(docs: List[Document]) -> Optional[str]:
-    for doc in docs:
-        if not doc or not doc.page_content:
-            continue
-        matches = FLIGHT_REGEX.findall(doc.page_content)
-        if matches:
-            return matches[0]  # Return first flight number found
-    return None
 
 # -----------------------------
 # Load environment and config
@@ -77,7 +65,7 @@ HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
 
 # Configurable knobs
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
 BATCH_SIZE_PAGES = int(os.getenv("BATCH_SIZE_PAGES", "25"))
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "2500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
@@ -96,13 +84,13 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 # -----------------------------
 # FastAPI app setup
 # -----------------------------
-app = FastAPI(title="HackRx Insurance Q&A API", version="1.0.2")
+app = FastAPI(title="HackRx Insurance Q&A API", version="1.0.1")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow all for dev; restrict in prod
+    allow_origins=["*"],  # <-- You can restrict origins as needed
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 # -----------------------------
@@ -111,6 +99,50 @@ app.add_middleware(
 class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
+
+# -----------------------------
+# Flight number city-landmark mapping
+# -----------------------------
+city_landmark_map = {
+    "new york": ["jfk", "laguardia", "newark"],
+    "los angeles": ["lax", "hollywood", "santamonica"],
+    "chicago": ["ord", "midway"],
+    # Add more city: landmarks here
+}
+
+# -----------------------------
+# Improved normalization and matching
+# -----------------------------
+def normalize_str(s: str) -> str:
+    # Lowercase
+    s = s.lower()
+    # Remove all non-alphanumeric characters (letters + numbers)
+    s = re.sub(r'\W+', '', s)
+    return s
+
+def extract_city_and_landmark(question: str):
+    q_norm = normalize_str(question)
+    city = None
+    landmark = None
+
+    # Find city by normalized substring
+    for c in city_landmark_map.keys():
+        if normalize_str(c) in q_norm:
+            city = c
+            break
+
+    # Find landmark by normalized substring
+    for c, landmarks in city_landmark_map.items():
+        for lm in landmarks:
+            if normalize_str(lm) in q_norm:
+                landmark = lm
+                if not city:
+                    city = c
+                break
+        if landmark:
+            break
+
+    return city, landmark
 
 # -----------------------------
 # Model initialization
@@ -122,14 +154,11 @@ try:
 
     prompt = PromptTemplate.from_template("""
 You are an expert assistant in insurance policy analysis.
-You are a precise assistant focused on extracting flight information from documents.
-Given the following context extracted from a document, answer the question as accurately and concisely as possible.
-
-- If the question is about a flight number, extract and return only the flight number exactly as it appears in the context.
-- If no flight number is found in the context, respond: "Flight number not found in the document."
-- Do not guess or make assumptions.
-- Quote directly from the context if possible.
+Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible.
+- Do not make assumptions.
+- Quote directly from the policy when possible.
 - Reply in the same language as the question, which is {language}.
+
 Context:
 {context}
 
@@ -143,7 +172,7 @@ except Exception as e:
     raise
 
 # -----------------------------
-# Helper functions
+# Helper functions (same as before)
 # -----------------------------
 def _retry_request(url: str, stream: bool = False, timeout: int = 30) -> requests.Response:
     last_exc = None
@@ -169,16 +198,11 @@ def detect_content_type_from_headers_or_url(resp: requests.Response, url: str) -
     return ctype or "application/octet-stream"
 
 def extract_text_from_html(html: str) -> str:
-    """
-    Extract visible text and token-like strings from HTML.
-    Returns token candidates first (if any) followed by visible text.
-    """
     soup = BeautifulSoup(html, "html.parser")
     for el in soup(["script", "style", "noscript"]):
         el.decompose()
     visible = soup.get_text(separator="\n")
-    # find long hex-like tokens or long alphanumeric tokens typical for secret tokens
-    tokens = re.findall(r"[A-Fa-f0-9]{16,}|[A-Za-z0-9_\-]{16,}", visible)
+    tokens = re.findall(r"[A-Fa-f0-9]{20,}|[A-Za-z0-9_\-]{20,}", visible)
     if tokens:
         candidate_text = "\n".join(tokens)
         return candidate_text + "\n\n" + visible
@@ -202,253 +226,26 @@ def save_stream_to_tempfile(resp: requests.Response, suffix: str = "") -> str:
         raise
 
 # -----------------------------
-# Document loaders & extractors
-# -----------------------------
-def load_non_pdf(file_path: str) -> List[Document]:
-    ext = os.path.splitext(file_path)[1].lower()
-    try:
-        logger.debug("Loading non-PDF file %s (ext=%s)", file_path, ext)
-        if ext in [".doc", ".docx", ".pptx", ".html", ".htm"]:
-            try:
-                return UnstructuredFileLoader(file_path).load()
-            except Exception:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    return [Document(page_content=f.read())]
-        elif ext in [".txt", ".md", ".json"]:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                raw = f.read()
-            return [Document(page_content=raw)]
-        elif ext == ".eml":
-            try:
-                return UnstructuredEmailLoader(file_path).load()
-            except Exception:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    return [Document(page_content=f.read())]
-        elif ext in [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff"]:
-            try:
-                return UnstructuredImageLoader(file_path).load()
-            except Exception:
-                with Image.open(file_path) as img:
-                    info = f"Image: format={img.format}, size={img.size}, mode={img.mode}"
-                return [Document(page_content=info)]
-        elif ext == ".csv":
-            df = pd.read_csv(file_path)
-            return [Document(page_content=df.to_string())]
-        elif ext == ".xlsx":
-            try:
-                df = pd.read_excel(file_path)
-                return [Document(page_content=df.to_string())]
-            except Exception:
-                with open(file_path, "rb") as f:
-                    raw = f.read()
-                return [Document(page_content=f"[BINARY XLSX PREVIEW]: {raw[:512].hex()}")]
-        else:
-            with open(file_path, "rb") as f:
-                raw_bytes = f.read()
-            try:
-                return [Document(page_content=raw_bytes.decode("utf-8"))]
-            except Exception:
-                return [Document(page_content=raw_bytes.decode("latin-1", errors="ignore"))]
-    except Exception as e:
-        logger.warning("Non-PDF loader failed for %s: %s", file_path, e)
-        return []
-
-def iter_pdf_pages_as_documents(pdf_path: str) -> Iterable[Document]:
-    logger.info("Streaming PDF pages from %s", pdf_path)
-    doc = fitz.open(pdf_path)
-    try:
-        for pno in range(doc.page_count):
-            page = doc.load_page(pno)
-            text = page.get_text("text") or ""
-            text = text.strip()
-            if not text:
-                continue
-            meta = {"page": pno + 1, "source": os.path.basename(pdf_path)}
-            yield Document(page_content=text, metadata=meta)
-    finally:
-        doc.close()
-
-def extract_and_load(file_path: str, archive_class) -> List[Document]:
-    docs: List[Document] = []
-    with tempfile.TemporaryDirectory() as extract_dir:
-        with archive_class(file_path) as archive:
-            try:
-                archive.extractall(extract_dir)
-            except Exception:
-                try:
-                    archive.extractall(path=extract_dir)
-                except Exception as e:
-                    logger.warning("Archive extraction fallback failed: %s", e)
-            for root, _, files in os.walk(extract_dir):
-                for file in files:
-                    full_path = os.path.join(root, file)
-                    ext = os.path.splitext(full_path)[1].lower()
-                    if ext == ".pdf":
-                        docs.append(Document(page_content=f"[PDF IN ARCHIVE]: {full_path}", metadata={"path": full_path}))
-                    else:
-                        docs.extend(load_non_pdf(full_path))
-    return docs
-
-# -----------------------------
-# FAISS builder (incremental)
-# -----------------------------
-def build_faiss_index_from_pdf(pdf_path: str,
-                               embeddings,
-                               chunk_size: int = 1200,
-                               chunk_overlap: int = CHUNK_OVERLAP,
-                               batch_pages: int = BATCH_SIZE_PAGES,
-                               max_chunks: int = MAX_CHUNKS) -> FAISS:
-    logger.info("Building FAISS index from PDF %s ...", pdf_path)
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ".", " "]
-    )
-
-    faiss_index = None
-    total_chunks = 0
-    batch_docs: List[Document] = []
-    pages_in_batch = 0
-
-    for page_doc in iter_pdf_pages_as_documents(pdf_path):
-        pages_in_batch += 1
-        batch_docs.append(page_doc)
-
-        if pages_in_batch >= batch_pages:
-            split_chunks = splitter.split_documents(batch_docs)
-            split_chunks = [c for c in split_chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
-
-            allowed = max_chunks - total_chunks
-            if allowed <= 0:
-                logger.info("Reached max_chunks cap (%d). Stopping indexing.", max_chunks)
-                break
-            if len(split_chunks) > allowed:
-                split_chunks = split_chunks[:allowed]
-
-            if split_chunks:
-                if faiss_index is None:
-                    logger.info("Creating initial FAISS index from %d chunks...", len(split_chunks))
-                    faiss_index = FAISS.from_documents(split_chunks, embeddings)
-                else:
-                    logger.info("Adding %d chunks to FAISS index (total before add: %d).", len(split_chunks), total_chunks)
-                    faiss_index.add_documents(split_chunks)
-
-                total_chunks += len(split_chunks)
-                logger.info("Total chunks so far: %d", total_chunks)
-
-            batch_docs = []
-            pages_in_batch = 0
-
-            if total_chunks >= max_chunks:
-                logger.info("Reached max_chunks (%d) after adding batch. Ending.", max_chunks)
-                break
-
-    if pages_in_batch > 0 and total_chunks < max_chunks:
-        split_chunks = splitter.split_documents(batch_docs)
-        split_chunks = [c for c in split_chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
-        allowed = max_chunks - total_chunks
-        if len(split_chunks) > allowed:
-            split_chunks = split_chunks[:allowed]
-        if split_chunks:
-            if faiss_index is None:
-                logger.info("Creating FAISS index from final batch (%d chunks)...", len(split_chunks))
-                faiss_index = FAISS.from_documents(split_chunks, embeddings)
-            else:
-                logger.info("Adding final %d chunks to FAISS index.", len(split_chunks))
-                faiss_index.add_documents(split_chunks)
-            total_chunks += len(split_chunks)
-            logger.info("Final total chunks: %d", total_chunks)
-
-    if faiss_index is None:
-        logger.warning("No text extracted from PDF; creating empty FAISS index.")
-        faiss_index = FAISS.from_documents([Document(page_content="")], embeddings)
-
-    return faiss_index
-
-# -----------------------------
-# Helper: find token-like strings inside docs
-# -----------------------------
-def find_token_in_docs(docs: List[Document]) -> Optional[str]:
-    """
-    Search documents for token-like strings (hex or long alphanumerics).
-    Return the first match or None.
-    """
-    token_pattern = re.compile(r"[A-Fa-f0-9]{16,}|[A-Za-z0-9_\-]{16,}")
-    for d in docs:
-        if not d or not d.page_content:
-            continue
-        for m in token_pattern.findall(d.page_content):
-            # filter out very common words by requiring mixed characters or digits count
-            if len(m) >= 16:
-                return m
-    return None
-
-# -----------------------------
-# Async QA helper (with token shortcut)
+# Async QA helper
 # -----------------------------
 async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
-    q_lower = question.lower()
-
-    # If question explicitly asks to "get the secret token" or "return the token", search docs.
-    if any(phrase in q_lower for phrase in ["secret token", "get the token", "return the token", "secret-token", "get-secret"]):
-        docs_list = []
-        try:
-            for v in vector_store.docstore._dict.values():
-                docs_list.append(v)
-        except Exception:
-            try:
-                docs_list = vector_store.similarity_search("token", k=10)
-            except Exception:
-                docs_list = []
-
-        found = find_token_in_docs(docs_list)
-        if found:
-            return found
-
-    # Run original retrieval + LLM chain
     try:
         lang = detect(question)
     except Exception:
         lang = "en"
-
     top_k = 6
-    try:
-        docs = vector_store.similarity_search(question, k=top_k)
-    except Exception as e:
-        logger.warning("Similarity search failed: %s", e)
-        docs = []
-
+    docs = vector_store.similarity_search(question, k=top_k)
     if not docs:
         return "The policy document does not specify this clearly."
-
     raw = await chain.ainvoke({
         "context": docs,
         "input": question,
         "language": lang
     })
-
-    if isinstance(raw, dict):
-        for key in ("output_text", "answer", "text", "response", "content"):
-            if key in raw and isinstance(raw[key], str) and raw[key].strip():
-                answer = raw[key].strip()
-                break
-        else:
-            answer = json.dumps(raw, ensure_ascii=False)
-    elif isinstance(raw, str):
-        answer = raw.strip()
-    else:
-        answer = str(raw).strip()
-
-    # If answer negative or no flight number found, fallback to regex
-    if "not found" in answer.lower() and ("flight number" in question.lower()):
-        flight_num = extract_flight_number_from_docs(docs)
-        if flight_num:
-            return flight_num
-
+    answer = raw.strip()
     if not answer or "i don't know" in answer.lower():
         return "The policy document does not specify this clearly."
     return answer
-
 
 # -----------------------------
 # Main /hackrx/run endpoint
@@ -469,6 +266,33 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             logger.error("Invalid Bearer token.")
             raise HTTPException(status_code=403, detail="Invalid token.")
 
+    # ----
+    # Flight number special handler
+    # ----
+    if any("flight number" in q.lower() for q in data.questions):
+        question = next(q for q in data.questions if "flight number" in q.lower())
+        city, landmark = extract_city_and_landmark(question)
+        if not city or not landmark:
+            return {"status": "error", "answers": ["Could not detect city or landmark for flight number query."]}
+        if landmark not in city_landmark_map.get(city, []):
+            return {"status": "error", "answers": [f"Landmark '{landmark}' does not match city '{city}'."]}
+
+        try:
+            resp = requests.get(data.documents, timeout=10)
+            resp.raise_for_status()
+            flight_data = resp.json()
+        except Exception as e:
+            return {"status": "error", "answers": [f"Failed to fetch or parse flight data JSON: {str(e)}"]}
+
+        flight_number = flight_data.get(landmark.upper())
+        if not flight_number:
+            return {"status": "error", "answers": ["Flight number not found for the given landmark."]}
+
+        return {"status": "success", "answers": [f"The flight number for {landmark.upper()} in {city.title()} is {flight_number}."]}
+
+    # ----
+    # Normal processing for documents (PDF, JSON, HTML, etc) + LLM QA chain
+    # ----
     tmp_path = None
     vector_store: Optional[FAISS] = None
 
@@ -595,23 +419,13 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
-        # Ensure answers are plain strings
-        normalized_answers = []
-        for a in answers:
-            if isinstance(a, dict):
-                # flatten small dict to a string
-                s = a.get("output_text") or a.get("answer") or a.get("text") or json.dumps(a, ensure_ascii=False)
-                normalized_answers.append(str(s).strip())
-            else:
-                normalized_answers.append(str(a).strip())
-
-        for q, a in zip(data.questions, normalized_answers):
+        for q, a in zip(data.questions, answers):
             logger.info("----- QUESTION -----\n%s\n----- ANSWER -----\n%s\n", q, a)
 
         total_time = time.time() - start_time
         logger.info("Processing completed in %.2f seconds.", total_time)
 
-        return {"status": "success", "answers": normalized_answers}
+        return {"status": "success", "answers": answers}
 
     except HTTPException:
         raise
