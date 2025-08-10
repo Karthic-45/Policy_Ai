@@ -1,36 +1,31 @@
 import requests
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
-import logging
+from fastapi import FastAPI, HTTPException, Header, Request
 
 app = FastAPI()
-logger = logging.getLogger("hackrx")
-logging.basicConfig(level=logging.INFO)
 
-class HackRxRequest(BaseModel):
-    documents: str
-    questions: list
-
-# Cleaned city → landmark mapping (no duplicate keys)
+# Full mapping from the provided PDF
 city_to_landmark = {
     "Delhi": "Gateway of India",
     "Mumbai": "India Gate",
     "Chennai": "Charminar",
-    "Hyderabad": "Marina Beach",         # kept one Hyderabad mapping
+    "Hyderabad": "Marina Beach",
     "Ahmedabad": "Howrah Bridge",
     "Mysuru": "Golconda Fort",
     "Kochi": "Qutub Minar",
-    "Pune": "Meenakshi Temple",          # kept one Pune mapping
+    "Hyderabad": "Taj Mahal",
+    "Pune": "Meenakshi Temple",
     "Nagpur": "Lotus Temple",
     "Chandigarh": "Mysore Palace",
     "Kerala": "Rock Garden",
     "Bhopal": "Victoria Memorial",
     "Varanasi": "Vidhana Soudha",
     "Jaisalmer": "Sun Temple",
+    "Pune": "Golden Temple",
     "New York": "Eiffel Tower",
-    "London": "Statue of Liberty",       # kept one London mapping
+    "London": "Statue of Liberty",
     "Tokyo": "Big Ben",
     "Beijing": "Colosseum",
+    "London": "Sydney Opera House",
     "Bangkok": "Christ the Redeemer",
     "Toronto": "Burj Khalifa",
     "Dubai": "CN Tower",
@@ -51,9 +46,11 @@ city_to_landmark = {
     "Vienna": "Blue Mosque",
     "Kathmandu": "Neuschwanstein Castle",
     "Los Angeles": "Buckingham Palace",
+    "Mumbai": "Space Needle",
+    "Seoul": "Times Square"
 }
 
-# Landmark → Flight API mapping
+# Mapping landmark → flight API endpoint
 landmark_to_endpoint = {
     "Gateway of India": "https://register.hackrx.in/teams/public/flights/getFirstCityFlightNumber",
     "Taj Mahal": "https://register.hackrx.in/teams/public/flights/getSecondCityFlightNumber",
@@ -62,45 +59,48 @@ landmark_to_endpoint = {
 }
 
 @app.post("/hackrx/run")
-def run_hackrx(data: HackRxRequest, Authorization: str = Header(None)):
+async def run_hackrx(request: Request, Authorization: str = Header(None)):
     try:
-        # Step 1: Get favourite city from external API
+        # Parse JSON body (flexible - no 422 errors)
+        body = await request.json()
+        documents = body.get("documents")
+        questions = body.get("questions", [])
+
+        # Step 1: Get favourite city from HackRx API
         city_resp = requests.get("https://register.hackrx.in/submissions/myFavouriteCity")
-        city_resp.raise_for_status()
+        if city_resp.status_code != 200:
+            raise HTTPException(status_code=400, detail="Error fetching favourite city")
         city = city_resp.text.strip()
-        logger.info(f"Favourite city received: {city}")
 
         if not city:
-            raise HTTPException(status_code=400, detail="Could not fetch favourite city")
+            raise HTTPException(status_code=400, detail="No favourite city found")
 
-        # Step 2: Map city to landmark
+        # Step 2: Map city → landmark
         landmark = city_to_landmark.get(city)
         if not landmark:
-            raise HTTPException(status_code=400, detail=f"No landmark found for city {city}")
+            raise HTTPException(status_code=400, detail=f"No landmark mapping found for city: {city}")
 
-        logger.info(f"Landmark for city {city}: {landmark}")
-
-        # Step 3: Get the flight number endpoint based on landmark, or default to 5th city flight number
+        # Step 3: Determine flight endpoint
         endpoint = landmark_to_endpoint.get(
             landmark,
             "https://register.hackrx.in/teams/public/flights/getFifthCityFlightNumber"
         )
 
-        # Step 4: Get flight number
+        # Step 4: Fetch flight number
         flight_resp = requests.get(endpoint)
-        flight_resp.raise_for_status()
+        if flight_resp.status_code != 200:
+            raise HTTPException(status_code=400, detail="Error fetching flight number")
         flight_number = flight_resp.text.strip()
-        logger.info(f"Flight number received: {flight_number}")
 
         if not flight_number:
             raise HTTPException(status_code=400, detail="Flight number not found")
 
-        # Return flight number as response
-        return {"flight_number": flight_number}
+        # Step 5: Return result
+        return {
+            "city": city,
+            "landmark": landmark,
+            "flight_number": flight_number
+        }
 
-    except requests.HTTPError as http_err:
-        logger.error(f"HTTP error occurred: {http_err}")
-        raise HTTPException(status_code=502, detail="Error contacting external API")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
