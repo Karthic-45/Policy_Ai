@@ -1,36 +1,36 @@
 import requests
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
+import logging
 
 app = FastAPI()
+logger = logging.getLogger("hackrx")
+logging.basicConfig(level=logging.INFO)
 
 class HackRxRequest(BaseModel):
     documents: str
     questions: list
 
-# Mapping from PDF (full)
+# Cleaned city → landmark mapping (no duplicate keys)
 city_to_landmark = {
     "Delhi": "Gateway of India",
     "Mumbai": "India Gate",
     "Chennai": "Charminar",
-    "Hyderabad": "Marina Beach",
+    "Hyderabad": "Marina Beach",         # kept one Hyderabad mapping
     "Ahmedabad": "Howrah Bridge",
     "Mysuru": "Golconda Fort",
     "Kochi": "Qutub Minar",
-    "Hyderabad": "Taj Mahal",
-    "Pune": "Meenakshi Temple",
+    "Pune": "Meenakshi Temple",          # kept one Pune mapping
     "Nagpur": "Lotus Temple",
     "Chandigarh": "Mysore Palace",
     "Kerala": "Rock Garden",
     "Bhopal": "Victoria Memorial",
     "Varanasi": "Vidhana Soudha",
     "Jaisalmer": "Sun Temple",
-    "Pune": "Golden Temple",
     "New York": "Eiffel Tower",
-    "London": "Statue of Liberty",
+    "London": "Statue of Liberty",       # kept one London mapping
     "Tokyo": "Big Ben",
     "Beijing": "Colosseum",
-    "London": "Sydney Opera House",
     "Bangkok": "Christ the Redeemer",
     "Toronto": "Burj Khalifa",
     "Dubai": "CN Tower",
@@ -51,8 +51,6 @@ city_to_landmark = {
     "Vienna": "Blue Mosque",
     "Kathmandu": "Neuschwanstein Castle",
     "Los Angeles": "Buckingham Palace",
-    "Mumbai": "Space Needle",
-    "Seoul": "Times Square"
 }
 
 # Landmark → Flight API mapping
@@ -66,28 +64,43 @@ landmark_to_endpoint = {
 @app.post("/hackrx/run")
 def run_hackrx(data: HackRxRequest, Authorization: str = Header(None)):
     try:
-        # Step 1: Get favourite city
-        city = requests.get("https://register.hackrx.in/submissions/myFavouriteCity").text.strip()
+        # Step 1: Get favourite city from external API
+        city_resp = requests.get("https://register.hackrx.in/submissions/myFavouriteCity")
+        city_resp.raise_for_status()
+        city = city_resp.text.strip()
+        logger.info(f"Favourite city received: {city}")
+
         if not city:
             raise HTTPException(status_code=400, detail="Could not fetch favourite city")
 
-        # Step 2: Map city → landmark
+        # Step 2: Map city to landmark
         landmark = city_to_landmark.get(city)
         if not landmark:
             raise HTTPException(status_code=400, detail=f"No landmark found for city {city}")
 
-        # Step 3: Select endpoint based on landmark
+        logger.info(f"Landmark for city {city}: {landmark}")
+
+        # Step 3: Get the flight number endpoint based on landmark, or default to 5th city flight number
         endpoint = landmark_to_endpoint.get(
             landmark,
             "https://register.hackrx.in/teams/public/flights/getFifthCityFlightNumber"
         )
 
         # Step 4: Get flight number
-        flight_number = requests.get(endpoint).text.strip()
+        flight_resp = requests.get(endpoint)
+        flight_resp.raise_for_status()
+        flight_number = flight_resp.text.strip()
+        logger.info(f"Flight number received: {flight_number}")
+
         if not flight_number:
             raise HTTPException(status_code=400, detail="Flight number not found")
 
+        # Return flight number as response
         return {"flight_number": flight_number}
 
+    except requests.HTTPError as http_err:
+        logger.error(f"HTTP error occurred: {http_err}")
+        raise HTTPException(status_code=502, detail="Error contacting external API")
     except Exception as e:
+        logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
