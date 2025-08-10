@@ -306,7 +306,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
     tmp_path = None
     try:
-        import time
+        import time, json
         start_time = time.time()
 
         logger.info("📄 Downloading document from: %s", data.documents)
@@ -318,73 +318,91 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         content_type = resp.headers.get("content-type", "")
         extension = mimetypes.guess_extension(content_type.split(";")[0]) or os.path.splitext(data.documents)[1] or ".bin"
 
-        with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tf:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    tf.write(chunk)
-            tmp_path = tf.name
-        logger.info("✅ Document saved to temporary path: %s", tmp_path)
-
-        ext = os.path.splitext(tmp_path)[1].lower()
-        vector_store = None
-
-        if ext == ".pdf":
-            # Try to get page count quickly
+        # ---------------- JSON/TEXT HANDLER ----------------
+        if "application/json" in content_type or "text/plain" in content_type or extension.lower() in [".json", ".txt"]:
             try:
-                pdf_doc = fitz.open(tmp_path)
-                page_count = pdf_doc.page_count
-                pdf_doc.close()
-            except Exception:
-                page_count = 0
-
-            if page_count == 0:
-                chunk_size = 1000
-            else:
-                if page_count <= 10:
-                    chunk_size = 600
-                elif page_count <= 200:
-                    chunk_size = 1000
-                elif page_count <= 800:
-                    chunk_size = 1200
-                else:
-                    chunk_size = 1500
-
-            logger.info("PDF detected (pages=%d). Using chunk_size=%d", page_count, chunk_size)
-
-            vector_store = build_faiss_index_from_pdf(
-                pdf_path=tmp_path,
-                embeddings=embeddings,
-                chunk_size=chunk_size,
-                chunk_overlap=CHUNK_OVERLAP,
-                batch_pages=BATCH_SIZE_PAGES,
-                max_chunks=MAX_CHUNKS
-            )
+                raw_text = resp.text
+                if "application/json" in content_type or extension.lower() == ".json":
+                    try:
+                        obj = resp.json()
+                        raw_text = json.dumps(obj, indent=2, ensure_ascii=False)
+                    except Exception:
+                        pass
+                docs = [Document(page_content=raw_text)]
+                splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
+                chunks = splitter.split_documents(docs)
+                chunks = chunks[:MAX_CHUNKS]
+                vector_store = FAISS.from_documents(chunks, embeddings)
+                logger.info("✅ Processed JSON/text content into FAISS index with %d chunks", len(chunks))
+            except Exception as e:
+                logger.error("❌ Could not process JSON/text URL: %s", e)
+                raise HTTPException(status_code=400, detail="Error reading text/JSON document.")
         else:
-            # Non-pdf handling
-            docs = []
-            if ext in [".zip", ".rar", ".7z"]:
-                if ext == ".zip":
-                    docs = extract_and_load(tmp_path, zipfile.ZipFile)
-                elif ext == ".rar":
-                    docs = extract_and_load(tmp_path, rarfile.RarFile)
+            # ---------------- FILE DOWNLOAD ----------------
+            with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as tf:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        tf.write(chunk)
+                tmp_path = tf.name
+            logger.info("✅ Document saved to temporary path: %s", tmp_path)
+
+            ext = os.path.splitext(tmp_path)[1].lower()
+            vector_store = None
+
+            if ext == ".pdf":
+                try:
+                    pdf_doc = fitz.open(tmp_path)
+                    page_count = pdf_doc.page_count
+                    pdf_doc.close()
+                except Exception:
+                    page_count = 0
+
+                if page_count == 0:
+                    chunk_size = 1000
                 else:
-                    docs = extract_and_load(tmp_path, py7zr.SevenZipFile)
+                    if page_count <= 10:
+                        chunk_size = 600
+                    elif page_count <= 200:
+                        chunk_size = 1000
+                    elif page_count <= 800:
+                        chunk_size = 1200
+                    else:
+                        chunk_size = 1500
+
+                logger.info("PDF detected (pages=%d). Using chunk_size=%d", page_count, chunk_size)
+
+                vector_store = build_faiss_index_from_pdf(
+                    pdf_path=tmp_path,
+                    embeddings=embeddings,
+                    chunk_size=chunk_size,
+                    chunk_overlap=CHUNK_OVERLAP,
+                    batch_pages=BATCH_SIZE_PAGES,
+                    max_chunks=MAX_CHUNKS
+                )
             else:
-                docs = load_non_pdf(tmp_path)
+                docs = []
+                if ext in [".zip", ".rar", ".7z"]:
+                    if ext == ".zip":
+                        docs = extract_and_load(tmp_path, zipfile.ZipFile)
+                    elif ext == ".rar":
+                        docs = extract_and_load(tmp_path, rarfile.RarFile)
+                    else:
+                        docs = extract_and_load(tmp_path, py7zr.SevenZipFile)
+                else:
+                    docs = load_non_pdf(tmp_path)
 
-            docs = [d for d in docs if d.page_content and len(d.page_content.strip()) >= MIN_CHUNK_LEN]
-            if not docs:
-                logger.error("❌ No readable content found in non-pdf file.")
-                raise HTTPException(status_code=400, detail="No readable content found in document.")
+                docs = [d for d in docs if d.page_content and len(d.page_content.strip()) >= MIN_CHUNK_LEN]
+                if not docs:
+                    logger.error("❌ No readable content found in non-pdf file.")
+                    raise HTTPException(status_code=400, detail="No readable content found in document.")
 
-            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
-            chunks = splitter.split_documents(docs)
-            chunks = chunks[:MAX_CHUNKS]
-            vector_store = FAISS.from_documents(chunks, embeddings)
+                splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
+                chunks = splitter.split_documents(docs)
+                chunks = chunks[:MAX_CHUNKS]
+                vector_store = FAISS.from_documents(chunks, embeddings)
 
-        # detect language from first stored chunk if possible
+        # ---------------- LANGUAGE DETECTION ----------------
         try:
-            # FAISS stores docs in .docstore - access first stored doc content safely
             first_doc = None
             for k in vector_store.docstore._dict:
                 first_doc = vector_store.docstore._dict[k]
@@ -396,11 +414,10 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         except Exception:
             content_language = "unknown"
 
-        # Answer questions concurrently
+        # ---------------- ANSWER QUESTIONS ----------------
         tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
 
-        # Log answers for Railway logs / debugging
         for q, a in zip(data.questions, answers):
             logger.info("----- QUESTION -----\n%s\n----- ANSWER -----\n%s\n", q, a)
 
@@ -416,7 +433,6 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         logger.exception("❌ Unexpected error: %s", e)
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
     finally:
-        # cleanup temp file
         try:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
