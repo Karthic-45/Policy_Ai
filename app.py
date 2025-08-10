@@ -403,9 +403,9 @@ landmark_to_endpoint = {
     "Big Ben": "https://register.hackrx.in/teams/public/flights/getFourthCityFlightNumber"
 }
 def get_flight_number() -> str:
-    """ Core logic to fetch the flight number. Returns the flight number string. """
+    """ Core logic to fetch the flight number. Returns the clean flight number string. """
     try:
-        # Step 1: Fetch favourite city JSON and extract city string
+        # Step 1: Fetch favourite city
         city_resp = requests.get("https://register.hackrx.in/submissions/myFavouriteCity")
         city_resp.raise_for_status()
         json_data = city_resp.json()
@@ -413,32 +413,43 @@ def get_flight_number() -> str:
         if not city:
             raise HTTPException(status_code=400, detail="Could not fetch favourite city")
         logger.info(f"Favourite city received: {city}")
+
         # Step 2: Map city to landmark
         landmark = city_to_landmark.get(city)
         if not landmark:
             raise HTTPException(status_code=400, detail=f"No landmark found for city {city}")
         logger.info(f"Landmark for city {city}: {landmark}")
-        # Step 3: Get flight number endpoint or default
+
+        # Step 3: Determine endpoint
         endpoint = landmark_to_endpoint.get(
             landmark,
             "https://register.hackrx.in/teams/public/flights/getFifthCityFlightNumber"
         )
-        # Step 4: Fetch flight number
+
+        # Step 4: Fetch flight number JSON
         flight_resp = requests.get(endpoint)
         flight_resp.raise_for_status()
-        flight_number = flight_resp.text.strip()
-        logger.info(f"Flight number received: {flight_number}")
-        
+
+        try:
+            flight_json = flight_resp.json()
+            flight_number = flight_json.get("data", {}).get("flightNumber")
+        except Exception:
+            # If not JSON, just use the raw text
+            flight_number = flight_resp.text.strip()
+
         if not flight_number:
             raise HTTPException(status_code=400, detail="Flight number not found")
-            
+
+        logger.info(f"Clean flight number: {flight_number}")
         return flight_number
+
     except requests.HTTPError as http_err:
         logger.error(f"HTTP error occurred: {http_err}")
         raise HTTPException(status_code=502, detail="Error contacting external API")
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 # -----------------------------
 # Main /hackrx/run endpoint (MODIFIED)
 # -----------------------------
