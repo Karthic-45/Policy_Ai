@@ -9,11 +9,6 @@ import logging
 import fitz  # PyMuPDF
 from typing import List, Optional, Iterable
 from langdetect import detect
-# Replace this import:
-# from langchain.document_loaders import UnstructuredFileLoader
-
-# With this:
-from langchain_unstructured import UnstructuredFileLoader
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from fastapi import FastAPI, HTTPException, Header
@@ -27,7 +22,7 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
 from langchain.schema import Document
 from langchain.document_loaders import (
-    TextLoader,
+    UnstructuredFileLoader, TextLoader,
     UnstructuredEmailLoader, UnstructuredImageLoader
 )
 
@@ -40,7 +35,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 # ------------------------------------------------
 
 # Load environment variables
