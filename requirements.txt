@@ -1,18 +1,35 @@
+# --- Core Backend ---
 fastapi
 uvicorn[standard]
 python-dotenv
+
+# --- LangChain Core ---
 langchain>=0.2.0
 langchain-core
 langchain-openai
 langchain-community
+
+# --- Embeddings and Vector DB ---
 openai
 faiss-cpu
-pandas
-langdetect
+
+# --- PDF Loading and Data Handling ---
 PyMuPDF
 pydantic
+pandas
+Pillow
+
+# --- Language Detection ---
+langdetect
+
+# --- Token Counting & NLP Utils ---
 tiktoken
 scikit-learn
+
+# --- Archive Handling ---
 rarfile
 py7zr
-Pillow
+
+# --- Additional Parsing ---
+beautifulsoup4
+lxml
