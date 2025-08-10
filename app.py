@@ -18,7 +18,7 @@ import logging
 import mimetypes
 import zipfile
 import asyncio
-from typing import List, Optional, Iterable
+from typing import List, Optional, Iterable, Tuple, Dict
 from functools import partial
 
 import requests
@@ -369,121 +369,97 @@ def find_token_in_docs(docs: List[Document]) -> Optional[str]:
     return None
 
 # -----------------------------
-# NEW: extract city & flight number from indexed docs or PDF fallback
+# New helper: extract city->landmark mapping from raw PDF text (dynamic, not hardcoded)
 # -----------------------------
-def extract_city_and_flight_from_docs(vector_store: Optional[FAISS], pdf_path: Optional[str] = None) -> (Optional[str], Optional[str]):
+def extract_city_landmark_map_from_text(raw_text: str) -> Dict[str, str]:
     """
-    Try multiple heuristics to find the favorite city and flight number:
-      - scan vector_store.docstore._dict documents (if available)
-      - fallback to scanning full PDF text if pdf_path provided
-    Returns (city, flight) or (None, None)
+    Parse the PDF plain text and attempt to extract lines that look like:
+      <emoji?> LandmarkName CityName
+    or split-on-multiple-spaces lines with landmark and city.
+    Returns dict: city.lower() -> landmark (original case)
+    This is heuristic but tuned for the table format in the sample.
     """
-    city = None
-    flight = None
-
-    # regex patterns to look for
-    city_patterns = [
-        re.compile(r"(?:Favorite|Favourite)?\s*City\s*[:\-]\s*(?P<city>[A-Za-z .,'\-()]+)", re.IGNORECASE),
-        re.compile(r"City\s*[:\-]\s*(?P<city>[A-Za-z .,'\-()]+)", re.IGNORECASE),
-        re.compile(r"Preferred\s*city\s*[:\-]\s*(?P<city>[A-Za-z .,'\-()]+)", re.IGNORECASE),
-    ]
-    flight_patterns = [
-        re.compile(r"Flight\s*(?:Number|No\.?|#)?\s*[:\-]?\s*(?P<flight>[A-Z0-9\-]{2,20})", re.IGNORECASE),
-        re.compile(r"Flight\s*[:\-]\s*(?P<flight>[A-Z0-9\-]{2,20})", re.IGNORECASE),
-        re.compile(r"PNR\s*[:\-]\s*(?P<flight>[A-Z0-9\-]{3,20})", re.IGNORECASE),
-    ]
-
-    docs_texts: List[str] = []
-
-    # gather docs from vector_store if possible
-    try:
-        if vector_store is not None:
-            # vector_store.docstore._dict values may be Documents
-            try:
-                for v in vector_store.docstore._dict.values():
-                    if isinstance(v, Document):
-                        docs_texts.append(v.page_content or "")
-                    elif isinstance(v, dict) and "page_content" in v:
-                        docs_texts.append(v.get("page_content", ""))
-                    else:
-                        # fallback: stringification
-                        docs_texts.append(str(v))
-            except Exception:
-                # alternative: similarity_search small queries to pull content
-                try:
-                    pulls = vector_store.similarity_search("favorite city", k=10)
-                    docs_texts.extend([d.page_content for d in pulls if getattr(d, "page_content", None)])
-                    pulls2 = vector_store.similarity_search("flight number", k=10)
-                    docs_texts.extend([d.page_content for d in pulls2 if getattr(d, "page_content", None)])
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.debug("extract_city_and_flight_from_docs: failed retrieving from vector_store: %s", e)
-
-    # If nothing from vector store, fallback to PDF text if available
-    if not docs_texts and pdf_path:
-        try:
-            with fitz.open(pdf_path) as pdf_doc:
-                for p in range(pdf_doc.page_count):
-                    page = pdf_doc.load_page(p)
-                    txt = page.get_text("text") or ""
-                    if txt:
-                        docs_texts.append(txt)
-        except Exception as e:
-            logger.debug("PDF fallback extraction failed: %s", e)
-
-    # scan collected texts for patterns
-    for text in docs_texts:
-        if not text:
+    mapping: Dict[str, str] = {}
+    # Normalize some invisible whitespace
+    cleaned = raw_text.replace('\u00a0', ' ')
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    # Heuristics: look for lines with landmark then city (last token(s) look like a city)
+    for ln in lines:
+        # skip header-like lines
+        if len(ln) < 4:
             continue
-        if city is None:
-            for cp in city_patterns:
-                m = cp.search(text)
-                if m:
-                    candidate = m.group("city").strip()
-                    # basic cleanup
-                    candidate = re.sub(r"\s{2,}", " ", candidate)
-                    city = candidate
-                    break
-        if flight is None:
-            for fp in flight_patterns:
-                m = fp.search(text)
-                if m:
-                    candidate = m.group("flight").strip()
-                    # normalize
-                    candidate = candidate.replace(" ", "").upper()
-                    flight = candidate
-                    break
-        if city and flight:
-            break
-
-    # Additional heuristic: find lines containing both city & landmark or city near 'landmark'
-    if (not city or not flight) and docs_texts:
-        for text in docs_texts:
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
-            for i, line in enumerate(lines):
-                # try to extract flight in the same or adjacent lines
-                if not flight:
-                    for fp in flight_patterns:
-                        m = fp.search(line)
-                        if m:
-                            flight = m.group("flight").strip().replace(" ", "").upper()
-                            break
-                if not city:
-                    for cp in city_patterns:
-                        m = cp.search(line)
-                        if m:
-                            city = m.group("city").strip()
-                            break
-                if city and flight:
-                    break
-            if city and flight:
-                break
-
-    return city, flight
+        # remove leading bullets/emojis if present
+        ln_clean = re.sub(r'^[\W_]+', '', ln).strip()
+        # If there are multiple big spaces or tab, split
+        if re.search(r'\s{2,}', ln_clean):
+            parts = re.split(r'\s{2,}', ln_clean)
+            if len(parts) >= 2:
+                landmark = parts[0].strip()
+                city = parts[-1].strip()
+                if landmark and city and len(city) < 40:
+                    mapping[city.lower()] = landmark
+                    continue
+        # Otherwise try rsplit once: last word(s) likely the city
+        # If last token is a single capitalized token or two tokens, accept
+        parts = ln_clean.rsplit(' ', 1)
+        if len(parts) == 2:
+            maybe_landmark, maybe_city = parts[0].strip(), parts[1].strip()
+            # city should start with uppercase letter
+            if maybe_city and maybe_city[0].isupper() and len(maybe_city) <= 30 and len(maybe_landmark) > 0:
+                mapping[maybe_city.lower()] = maybe_landmark
+                continue
+        # As a fallback, try rsplit two tokens
+        parts2 = ln_clean.rsplit(' ', 2)
+        if len(parts2) == 3:
+            maybe_landmark = parts2[0].strip()
+            maybe_city = (parts2[1] + " " + parts2[2]).strip()
+            if maybe_city and maybe_city[0].isupper() and len(maybe_city) <= 40:
+                mapping[maybe_city.lower()] = maybe_landmark
+                continue
+    return mapping
 
 # -----------------------------
-# Async QA helper (with token shortcut)
+# Helper: choose flight endpoint for a landmark (these are the rules in the PDF)
+# -----------------------------
+def choose_flight_endpoint_for_landmark(landmark: str) -> str:
+    """
+    Based on the PDF instructions:
+      - Gateway of India -> getFirstCityFlightNumber
+      - Taj Mahal -> getSecondCityFlightNumber
+      - Eiffel Tower -> getThirdCityFlightNumber
+      - Big Ben -> getFourthCityFlightNumber
+      - otherwise -> getFifthCityFlightNumber
+    """
+    base = "https://register.hackrx.in/teams/public/flights/"
+    if not landmark:
+        return base + "getFifthCityFlightNumber"
+    key = landmark.strip().lower()
+    if "gateway of india" in key or "gateway" in key and "india" in key:
+        return base + "getFirstCityFlightNumber"
+    if "taj mahal" in key or "taj" in key:
+        return base + "getSecondCityFlightNumber"
+    if "eiffel" in key or "eiffel tower" in key:
+        return base + "getThirdCityFlightNumber"
+    if "big ben" in key or ("big" in key and "ben" in key):
+        return base + "getFourthCityFlightNumber"
+    return base + "getFifthCityFlightNumber"
+
+# -----------------------------
+# Helper: read entire PDF text (safe fallback) and return mapping
+# -----------------------------
+def read_pdf_full_text(pdf_path: str) -> str:
+    try:
+        with fitz.open(pdf_path) as pdf_doc:
+            pages = []
+            for p in pdf_doc:
+                pages.append(p.get_text("text") or "")
+            return "\n".join(pages)
+    except Exception as e:
+        logger.warning("Failed to read full PDF text: %s", e)
+        return ""
+
+# -----------------------------
+# Async QA helper (with token shortcut) -- unchanged
 # -----------------------------
 async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
     """
@@ -552,7 +528,7 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
     return answer
 
 # -----------------------------
-# Main /hackrx/run endpoint
+# Main /hackrx/run endpoint (modified to auto-handle flight-number questions)
 # -----------------------------
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None), request: Request = None):
@@ -572,6 +548,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 
     tmp_path = None
     vector_store: Optional[FAISS] = None
+    pdf_full_text = ""
 
     try:
         start_time = time.time()
@@ -638,6 +615,11 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                     except Exception as e2:
                         logger.exception("Full PDF extraction fallback failed: %s", e2)
                         raise HTTPException(status_code=500, detail="Failed to extract text from PDF.")
+                # also capture full PDF text for dynamic mapping extraction
+                try:
+                    pdf_full_text = read_pdf_full_text(tmp_path)
+                except Exception:
+                    pdf_full_text = ""
 
             elif ext in [".zip", ".rar", ".7z"]:
                 docs = []
@@ -692,91 +674,173 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         except Exception:
             content_language = "unknown"
 
-        # --- NEW: handle flight-number questions directly by scanning docs/PDF ---
-        answers: List[str] = []
-        pending_tasks = []
-        pending_q_indices = []
-
-        # Pre-scan vector_store/pdf for city + flight (to service "What is my flight number?" quickly)
-        try:
-            pre_city, pre_flight = extract_city_and_flight_from_docs(vector_store, tmp_path)
-            logger.info("Pre-scan found city=%s flight=%s", pre_city, pre_flight)
-        except Exception as e:
-            logger.debug("Pre-scan failed: %s", e)
-            pre_city, pre_flight = None, None
-
-        # For each question: if it asks for flight number, answer from pre-scan if possible.
+        # ---------------------------------------------------------------------
+        # Special-case: if any question asks for a "flight number", handle automatically
+        # ---------------------------------------------------------------------
+        flight_answers: Dict[int, str] = {}
+        flight_question_indices: List[int] = []
         for idx, q in enumerate(data.questions):
-            q_lower = q.strip().lower()
-            if any(phrase in q_lower for phrase in ["flight number", "what is my flight", "my flight number", "what's my flight"]):
-                # attempt to answer directly
-                if pre_flight:
-                    if pre_city:
-                        answers.append(f"Favorite city: {pre_city}. Flight number: {pre_flight}")
+            if re.search(r"\bflight\s*number\b|\bflight\b|\bflight-number\b", q, re.IGNORECASE):
+                flight_question_indices.append(idx)
+
+        if flight_question_indices:
+            # Attempt automatic flow for flight number questions
+            try:
+                # 1) call favourite city endpoint
+                fav_city_url = "https://register.hackrx.in/submissions/myFavouriteCity"
+                logger.info("Querying favourite city endpoint: %s", fav_city_url)
+                fav_resp = _retry_request(fav_city_url, stream=False, timeout=15)
+                fav_resp.raise_for_status()
+                try:
+                    fav_json = fav_resp.json()
+                    # attempt to read common keys
+                    if isinstance(fav_json, dict):
+                        # try typical keys or assume the value itself is the city
+                        fav_city = None
+                        for key in ("city", "favouriteCity", "favoriteCity", "myFavouriteCity", "myFavoriteCity", "data"):
+                            if key in fav_json and isinstance(fav_json[key], str):
+                                fav_city = fav_json[key]
+                                break
+                        if fav_city is None:
+                            # maybe the response is {"city": {"name": "Chennai"}} or similar
+                            # try to find any string value
+                            for v in fav_json.values():
+                                if isinstance(v, str) and v.strip():
+                                    fav_city = v
+                                    break
                     else:
-                        answers.append(f"Flight number: {pre_flight}")
-                else:
-                    # If not found in pre-scan, try a deeper scan pulling similar docs
+                        # if response not a dict, treat as plain text
+                        fav_city = str(fav_json).strip()
+                except Exception:
+                    fav_city = fav_resp.text.strip()
+
+                # Normalise city
+                fav_city_simple = (fav_city or "").strip().strip('"').strip("'")
+                logger.info("Favourite city from API: %s", fav_city_simple)
+
+                # 2) if we have PDF full text, extract mapping
+                city_landmark_map = {}
+                if pdf_full_text:
+                    city_landmark_map = extract_city_landmark_map_from_text(pdf_full_text)
+                    logger.info("Extracted %d city->landmark entries from PDF pre-scan", len(city_landmark_map))
+
+                # 3) If mapping empty (or didn't include the favorite), attempt to extract from vector_store docs
+                if (not city_landmark_map) or (fav_city_simple and fav_city_simple.lower() not in city_landmark_map):
+                    # Try to reconstruct full text from vector store docstore
                     try:
-                        if vector_store:
-                            deeper_docs = []
-                            try:
-                                # get some docs likely to mention flight/city
-                                deeper_docs.extend(vector_store.similarity_search("flight number", k=12))
-                                deeper_docs.extend(vector_store.similarity_search("favorite city", k=12))
-                            except Exception:
-                                pass
-                            # convert to Document list
-                            texts = [d.page_content for d in deeper_docs if getattr(d, "page_content", None)]
-                            combined = "\n\n".join(texts)
-                            # run regex on combined
-                            c, f = None, None
-                            if combined:
-                                c, f = extract_city_and_flight_from_docs(None, None)  # will not use vector_store
-                            # fallback: PDF scan
-                            if (not f) and tmp_path:
-                                c2, f2 = extract_city_and_flight_from_docs(None, tmp_path)
-                                if f2:
-                                    f = f2
-                                if c2:
-                                    c = c2
-                            if f:
-                                if c:
-                                    answers.append(f"Favorite city: {c}. Flight number: {f}")
-                                else:
-                                    answers.append(f"Flight number: {f}")
-                            else:
-                                # nothing found, fallback to normal RAG
-                                pending_q_indices.append(idx)
-                                pending_tasks.append(ask_async_chain(qa_chain, vector_store, q.strip()))
-                                answers.append(None)  # placeholder
-                        else:
-                            # no vector store (shouldn't happen), fallback to LLM
-                            pending_q_indices.append(idx)
-                            pending_tasks.append(ask_async_chain(qa_chain, vector_store, q.strip()))
-                            answers.append(None)
+                        vs_text_parts = []
+                        for v in vector_store.docstore._dict.values():
+                            if hasattr(v, "page_content") and v.page_content:
+                                vs_text_parts.append(v.page_content)
+                            elif isinstance(v, dict):
+                                vs_text_parts.append(json.dumps(v))
+                        vs_text = "\n".join(vs_text_parts)
+                        if vs_text:
+                            additional_map = extract_city_landmark_map_from_text(vs_text)
+                            for k, v in additional_map.items():
+                                if k not in city_landmark_map:
+                                    city_landmark_map[k] = v
+                            logger.info("Merged %d additional mapping entries from vector_store", len(additional_map))
                     except Exception as e:
-                        logger.debug("Deep scan for flight failed: %s", e)
-                        pending_q_indices.append(idx)
-                        pending_tasks.append(ask_async_chain(qa_chain, vector_store, q.strip()))
-                        answers.append(None)
-            else:
-                # not a flight question -> handle normally via chain
-                pending_q_indices.append(idx)
-                pending_tasks.append(ask_async_chain(qa_chain, vector_store, q.strip()))
-                answers.append(None)
+                        logger.debug("Could not construct mapping from vector_store: %s", e)
 
-        # run pending tasks concurrently
+                # 4) Find the landmark for the favorite city
+                landmark = None
+                if fav_city_simple:
+                    landmark = city_landmark_map.get(fav_city_simple.lower())
+                if not landmark:
+                    # try fuzzy search: check substring matches
+                    lowered = fav_city_simple.lower()
+                    for city_key, lm in city_landmark_map.items():
+                        if lowered and lowered in city_key:
+                            landmark = lm
+                            break
+                logger.info("Pre-scan found city=%s landmark=%s", fav_city_simple or None, landmark or None)
+
+                # 5) pick endpoint for landmark (per PDF instructions) and call it
+                flight_number_result = None
+                flight_endpoint_url = choose_flight_endpoint_for_landmark(landmark or "")
+                logger.info("Calling flight endpoint: %s", flight_endpoint_url)
+                try:
+                    flight_resp = _retry_request(flight_endpoint_url, stream=False, timeout=15)
+                    flight_resp.raise_for_status()
+                    # attempt to parse JSON first
+                    try:
+                        frj = flight_resp.json()
+                        # try to find any string/number value that looks like a flight
+                        if isinstance(frj, dict):
+                            for val in frj.values():
+                                if isinstance(val, (str, int)) and str(val).strip():
+                                    flight_number_result = str(val).strip()
+                                    break
+                            if not flight_number_result:
+                                # maybe nested
+                                s = json.dumps(frj)
+                                flight_number_result = s.strip()
+                        else:
+                            flight_number_result = str(frj).strip()
+                    except Exception:
+                        # fallback to text
+                        flight_text = flight_resp.text.strip()
+                        flight_number_result = flight_text
+                except Exception as e:
+                    logger.warning("Flight endpoint call failed: %s", e)
+                    flight_number_result = None
+
+                # 6) Clean up flight_number_result heuristically
+                if flight_number_result:
+                    # extract plausible flight-like token: alphanumeric sequence or word
+                    m = re.search(r"[A-Za-z0-9_\-]{2,}", flight_number_result)
+                    if m:
+                        final_flight = m.group(0)
+                    else:
+                        final_flight = flight_number_result.strip()
+                else:
+                    final_flight = None
+
+                # Compose answers for all flight-question indices
+                for idx in flight_question_indices:
+                    if final_flight:
+                        ans = f"Flight number: {final_flight}"
+                    else:
+                        ans = "Could not retrieve flight number automatically."
+                    flight_answers[idx] = ans
+
+            except Exception as e:
+                logger.exception("Automatic flight-number flow failed: %s", e)
+                # leave flight_answers empty and fall back to RAG for those questions
+
+        # ---------------------------------------------------------------------
+        # Answer remaining questions (or all) via RAG chain as before
+        # ---------------------------------------------------------------------
+        # For questions that were handled by automatic flight flow, keep the answer
+        # For others call the chain
+        answers = [None] * len(data.questions)
+
+        # Fill any flight answers we computed
+        for idx, ans in flight_answers.items():
+            answers[idx] = ans
+
+        # For questions not yet answered, run RAG concurrently
+        pending_tasks = []
+        pending_indices = []
+        for idx, q in enumerate(data.questions):
+            if answers[idx] is not None:
+                continue
+            pending_indices.append(idx)
+            pending_tasks.append(ask_async_chain(qa_chain, vector_store, q.strip()))
+
         if pending_tasks:
-            results = await asyncio.gather(*pending_tasks, return_exceptions=False)
-            # place results into answers in the order of pending_q_indices
-            for i, res in enumerate(results):
-                ans_idx = pending_q_indices[i]
-                # if answers slot already has direct answer (unlikely), skip
-                answers[ans_idx] = (res if isinstance(res, str) else str(res))
+            pending_results = await asyncio.gather(*pending_tasks)
+            for idx, res in zip(pending_indices, pending_results):
+                if isinstance(res, dict):
+                    s = res.get("output_text") or res.get("answer") or res.get("text") or json.dumps(res, ensure_ascii=False)
+                    answers[idx] = str(s).strip()
+                else:
+                    answers[idx] = str(res).strip()
 
-        # Ensure answers are strings and in same order as questions
-        normalized_answers = [str(a).strip() if a is not None else "" for a in answers]
+        # Ensure answers array fully populated
+        normalized_answers = [ (a if isinstance(a, str) else str(a)) for a in answers ]
 
         for q, a in zip(data.questions, normalized_answers):
             logger.info("----- QUESTION -----\n%s\n----- ANSWER -----\n%s\n", q, a)
