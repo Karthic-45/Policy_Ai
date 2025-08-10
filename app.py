@@ -76,7 +76,7 @@ DOWNLOAD_BACKOFF = float(os.getenv("DOWNLOAD_BACKOFF", "0.8"))
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 
 # Ensure OpenAI key available to libs that use env var
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
