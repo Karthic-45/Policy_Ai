@@ -50,18 +50,6 @@ from langchain.document_loaders import (
     UnstructuredFileLoader, TextLoader,
     UnstructuredEmailLoader, UnstructuredImageLoader
 )
-import re
-
-FLIGHT_REGEX = re.compile(r"\b[A-Z]{2}\d{3,4}\b")
-
-def extract_flight_number_from_docs(docs: List[Document]) -> Optional[str]:
-    for doc in docs:
-        if not doc or not doc.page_content:
-            continue
-        matches = FLIGHT_REGEX.findall(doc.page_content)
-        if matches:
-            return matches[0]  # Return first flight number found
-    return None
 
 # -----------------------------
 # Load environment and config
@@ -77,7 +65,7 @@ HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
 
 # Configurable knobs
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
 BATCH_SIZE_PAGES = int(os.getenv("BATCH_SIZE_PAGES", "25"))
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "2500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
@@ -88,7 +76,7 @@ DOWNLOAD_BACKOFF = float(os.getenv("DOWNLOAD_BACKOFF", "0.8"))
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(_name_)
 
 # Ensure OpenAI key available to libs that use env var
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
@@ -122,14 +110,11 @@ try:
 
     prompt = PromptTemplate.from_template("""
 You are an expert assistant in insurance policy analysis.
-You are a precise assistant focused on extracting flight information from documents.
-Given the following context extracted from a document, answer the question as accurately and concisely as possible.
-
-- If the question is about a flight number, extract and return only the flight number exactly as it appears in the context.
-- If no flight number is found in the context, respond: "Flight number not found in the document."
-- Do not guess or make assumptions.
-- Quote directly from the context if possible.
+Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible.
+- Do not make assumptions.
+- Quote directly from the policy when possible.
 - Reply in the same language as the question, which is {language}.
+
 Context:
 {context}
 
@@ -384,18 +369,72 @@ def find_token_in_docs(docs: List[Document]) -> Optional[str]:
     return None
 
 # -----------------------------
-# Async QA helper (with token shortcut)
+# === Added: Flight number extraction helper ===
+# -----------------------------
+def extract_flight_number_from_docs(docs: List[Document]) -> Optional[str]:
+    """
+    Try to find a flight number pattern in given documents.
+    Matches examples: "AI-203", "AI203", "6E-512", "EK512", "BA287"
+    Returns first match or None.
+    """
+    if not docs:
+        return None
+    combined = " ".join(d.page_content for d in docs if getattr(d, "page_content", None))
+    # common flight number patterns: [A-Z]{1,3}-?\d{1,4}
+    pattern = re.compile(r"\b([A-Z]{1,3}-?\d{2,4})\b")
+    # search for likely candidates but try to avoid matching things like "I-95" (rudimentary)
+    matches = pattern.findall(combined)
+    if not matches:
+        return None
+    # simple heuristics: prefer those with letters followed by numbers, and not purely uppercase words
+    for m in matches:
+        # ignore purely alphabetic strings
+        if re.fullmatch(r"[A-Z]{2,}", m):
+            continue
+        # ignore matches that look like page numbers like "P.123" already filtered by pattern
+        return m
+    return matches[0] if matches else None
+
+# -----------------------------
+# Async QA helper (with token & flight shortcuts)
 # -----------------------------
 async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
+    """
+    If question asks specifically for a 'secret token' or 'token', try to find it
+    directly from the indexed documents before calling the LLM.
+    If question asks for flight number, try to extract from docs first.
+    Otherwise, run RAG + chain.
+    """
     q_lower = question.lower()
+
+    # --- Special: flight number shortcut ---
+    if "flight number" in q_lower or "what is my flight number" in q_lower or "what's my flight number" in q_lower:
+        docs_list = []
+        try:
+            # try to pull existing stored docs from vector_store
+            for v in vector_store.docstore._dict.values():
+                docs_list.append(v)
+        except Exception:
+            try:
+                # fallback: run a wide similarity search for 'flight' to pull candidate docs
+                docs_list = vector_store.similarity_search("flight", k=50)
+            except Exception:
+                docs_list = []
+
+        found_flight = extract_flight_number_from_docs(docs_list)
+        if found_flight:
+            return found_flight
+        # if not found, continue to token/normal flow (it will fall back to LLM)
 
     # If question explicitly asks to "get the secret token" or "return the token", search docs.
     if any(phrase in q_lower for phrase in ["secret token", "get the token", "return the token", "secret-token", "get-secret"]):
+        # grab stored docs from vector_store
         docs_list = []
         try:
             for v in vector_store.docstore._dict.values():
                 docs_list.append(v)
         except Exception:
+            # fallback to similarity search across a simple query to pull some docs
             try:
                 docs_list = vector_store.similarity_search("token", k=10)
             except Exception:
@@ -405,7 +444,7 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         if found:
             return found
 
-    # Run original retrieval + LLM chain
+    # Fall back to normal retrieval + chain
     try:
         lang = detect(question)
     except Exception:
@@ -427,28 +466,24 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         "language": lang
     })
 
+    # chain.ainvoke may return a dict or string depending on chain implementation
     if isinstance(raw, dict):
+        # common fields: 'text', 'answer', 'output_text'
         for key in ("output_text", "answer", "text", "response", "content"):
             if key in raw and isinstance(raw[key], str) and raw[key].strip():
                 answer = raw[key].strip()
                 break
         else:
+            # fallback to json dump
             answer = json.dumps(raw, ensure_ascii=False)
     elif isinstance(raw, str):
         answer = raw.strip()
     else:
         answer = str(raw).strip()
 
-    # If answer negative or no flight number found, fallback to regex
-    if "not found" in answer.lower() and ("flight number" in question.lower()):
-        flight_num = extract_flight_number_from_docs(docs)
-        if flight_num:
-            return flight_num
-
     if not answer or "i don't know" in answer.lower():
         return "The policy document does not specify this clearly."
     return answer
-
 
 # -----------------------------
 # Main /hackrx/run endpoint
