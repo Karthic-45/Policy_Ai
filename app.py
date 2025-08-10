@@ -1,21 +1,30 @@
-#!/usr/bin/env python3
 import os
 import re
 import tempfile
 import requests
 import fitz  # PyMuPDF
+import logging
+from dotenv import load_dotenv
+from typing import List
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dotenv import load_dotenv
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 load_dotenv()
 
-# Config
-BEARER_TOKEN = "cff339776dc80b453cdfbfa2f4e8dbafe3fa28e3c05fcebba73c46680c8bf594"  # replace with actual
-PDF_TIMEOUT = 30
+# ---------------- CONFIG ----------------
+BEARER_TOKEN = os.getenv("cff339776dc80b453cdfbfa2f4e8dbafe3fa28e3c05fcebba73c46680c8bf594")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+FLIGHT_CITY_API = os.getenv("FLIGHT_CITY_API", "https://register.hackrx.in/submissions/myFavouriteCity")
 
-app = FastAPI(title="Flight Number Extractor", version="1.0.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="HackRx Flight Finder")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,74 +35,88 @@ app.add_middleware(
 
 class HackRxRequest(BaseModel):
     documents: str
-    questions: list[str]
+    questions: List[str]
+
+# ---------------- HELPERS ----------------
+def verify_bearer(auth_header: str):
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    token = auth_header.split("Bearer ")[-1].strip()
+    if token != BEARER_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid token.")
 
 def download_pdf(url: str) -> str:
-    resp = requests.get(url, stream=True, timeout=PDF_TIMEOUT)
-    resp.raise_for_status()
-    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    for chunk in resp.iter_content(8192):
-        tf.write(chunk)
-    tf.close()
-    return tf.name
+    resp = requests.get(url, stream=True)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="Could not download PDF.")
+    tmp_path = tempfile.mktemp(suffix=".pdf")
+    with open(tmp_path, "wb") as f:
+        for chunk in resp.iter_content(1024):
+            f.write(chunk)
+    return tmp_path
 
-def extract_text(pdf_path: str) -> str:
-    text = []
-    doc = fitz.open(pdf_path)
+def extract_text_from_pdf(path: str) -> str:
+    doc = fitz.open(path)
+    text = ""
     for page in doc:
-        text.append(page.get_text())
-    doc.close()
-    return "\n".join(text)
+        text += page.get_text()
+    return text
 
-def find_city_and_landmark(text: str):
-    # Example regex — adjust as needed for actual PDF format
-    city_match = re.search(r"Your favorite city is\s*:\s*(\w+)", text, re.IGNORECASE)
-    landmark_match = re.search(r"Landmark\s*:\s*(.+)", text, re.IGNORECASE)
+def find_city_and_landmark(pdf_text: str):
+    city_match = re.search(r"(?i)(?:city|favourite city)\s*[:\-]\s*([A-Za-z\s]+)", pdf_text)
+    landmark_match = re.search(r"(?i)landmark\s*[:\-]\s*([A-Za-z\s]+)", pdf_text)
 
     city = city_match.group(1).strip() if city_match else None
     landmark = landmark_match.group(1).strip() if landmark_match else None
 
     return city, landmark
 
-def call_flight_number_api(base_url: str, landmark: str):
-    params = {"landmark": landmark}
-    headers = {"Authorization": f"Bearer {BEARER_TOKEN}"}
-    resp = requests.get(base_url, params=params, headers=headers, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("flight_number") or data.get("flight") or "UNKNOWN"
-
-@app.post("/hackrx/run")
-def hackrx_run(data: HackRxRequest, authorization: str = Header(None)):
-    # Bearer auth check
-    if BEARER_TOKEN:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-        token = authorization.split("Bearer ")[1]
-        if token != BEARER_TOKEN:
-            raise HTTPException(status_code=403, detail="Invalid token.")
-
+def get_city_from_api():
     try:
-        pdf_path = download_pdf(data.documents)
-        text = extract_text(pdf_path)
-
-        city, landmark = find_city_and_landmark(text)
-        if not city or not landmark:
-            raise HTTPException(status_code=400, detail="City or landmark not found in PDF.")
-
-        # Extract API endpoint from PDF text
-        url_match = re.search(r"https?://[^\s]+/getFlight", text)
-        if not url_match:
-            raise HTTPException(status_code=400, detail="Flight API URL not found in PDF.")
-        flight_api_url = url_match.group(0)
-
-        flight_number = call_flight_number_api(flight_api_url, landmark)
-
-        return {"flight_number": flight_number}
-
+        resp = requests.get(FLIGHT_CITY_API, timeout=10)
+        data = resp.json()
+        return data.get("data", {}).get("city")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error calling city API: {e}")
+        return None
 
-@app.get("/")
-def health():
-    return {"status": "running"}
+def get_flight_number(city: str):
+    try:
+        flight_api_url = f"https://register.hackrx.in/submissions/flightNumber?city={city}"
+        resp = requests.get(flight_api_url, timeout=10)
+        data = resp.json()
+        return data.get("data", {}).get("flight_number")
+    except Exception as e:
+        logger.error(f"Error calling flight number API: {e}")
+        return None
+
+# ---------------- MAIN ENDPOINT ----------------
+@app.post("/hackrx/run")
+def hackrx_run(req: HackRxRequest, authorization: str = Header(None)):
+    verify_bearer(authorization)
+    logger.info(f"Received /hackrx/run for document: {req.documents}")
+
+    pdf_path = download_pdf(req.documents)
+    pdf_text = extract_text_from_pdf(pdf_path)
+
+    # Try to find city & landmark in PDF
+    city, landmark = find_city_and_landmark(pdf_text)
+
+    if not city:
+        logger.info("City not found in PDF, calling city API...")
+        city = get_city_from_api()
+
+    if not city:
+        raise HTTPException(status_code=400, detail="City or landmark not found in PDF.")
+
+    logger.info(f"Detected city: {city}")
+
+    # Get flight number
+    flight_number = get_flight_number(city)
+    if not flight_number:
+        raise HTTPException(status_code=400, detail="Flight number not found.")
+
+    return {
+        "status": "success",
+        "answers": [f"Flight number: {flight_number}"]
+    }
