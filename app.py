@@ -9,12 +9,12 @@ import logging
 import mimetypes
 import zipfile
 import asyncio
-import httpx
 from typing import List, Optional, Iterable
-from functools import lru_cache, partial
+from functools import partial
+import requests
 import fitz  # PyMuPDF
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -35,7 +35,6 @@ from langchain.document_loaders import (
     UnstructuredEmailLoader,
     UnstructuredImageLoader,
 )
-from concurrent.futures import ThreadPoolExecutor
 
 # -----------------------------
 # Load environment and config
@@ -66,8 +65,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-
-executor = ThreadPoolExecutor(max_workers=4)
 
 def load_json_file(file_path, default=None):
     try:
@@ -111,29 +108,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -----------------------------
+# Request model
+# -----------------------------
 class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
 
+# -----------------------------
 # Model initialization
-logger.info("Initializing embeddings and LLM...")
-embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
-llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.1)
-prompt = PromptTemplate.from_template(prompt_template_str)
-qa_chain = create_stuff_documents_chain(llm, prompt)
-logger.info("Models initialized successfully.")
+# -----------------------------
+try:
+    logger.info("Initializing embeddings and LLM...")
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.1)
+    prompt = PromptTemplate.from_template(prompt_template_str)
+    qa_chain = create_stuff_documents_chain(llm, prompt)
+    logger.info("Models initialized successfully.")
+except Exception as e:
+    logger.exception("Failed to initialize models: %s", e)
+    raise
 
 # -----------------------------
-# Helper functions (Optimized)
+# Helper functions
 # -----------------------------
+def _retry_request(url: str, stream: bool = False, timeout: int = 30) -> requests.Response:
+    last_exc = None
+    for attempt in range(1 + DOWNLOAD_RETRIES):
+        try:
+            logger.debug("Downloading (%d/%d): %s", attempt + 1, DOWNLOAD_RETRIES + 1, url)
+            resp = requests.get(url, stream=stream, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last_exc = e
+            logger.warning("Download attempt %d failed: %s", attempt + 1, e)
+            time.sleep(DOWNLOAD_BACKOFF * (2 ** attempt))
+    logger.error("All download attempts failed for %s", url)
+    raise last_exc
 
-async def async_http_get(url, stream=False, timeout=30):
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        return resp
-
-def detect_content_type_from_headers_or_url(resp, url: str) -> str:
+def detect_content_type_from_headers_or_url(resp: requests.Response, url: str) -> str:
     ctype = (resp.headers.get("content-type") or "").lower()
     if not ctype or ctype == "application/octet-stream":
         guessed, _ = mimetypes.guess_type(url)
@@ -152,18 +166,12 @@ def extract_text_from_html(html: str) -> str:
         return candidate_text + "\n\n" + visible
     return visible
 
-async def save_stream_to_tempfile_async(resp, suffix: str = "") -> str:
-    loop = asyncio.get_running_loop()
+def save_stream_to_tempfile(resp: requests.Response, suffix: str = "") -> str:
     tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
-        if hasattr(resp, "aiter_bytes"):
-            async for chunk in resp.aiter_bytes():
-                if chunk:
-                    await loop.run_in_executor(executor, tf.write, chunk)
-        else:  # fallback for sync
-            for chunk in resp.iter_bytes():
-                if chunk:
-                    tf.write(chunk)
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                tf.write(chunk)
         tf.flush()
         tf.close()
         return tf.name
@@ -260,16 +268,6 @@ def extract_and_load(file_path: str, archive_class) -> List[Document]:
                     docs.extend(load_non_pdf(full_path))
     return docs
 
-# --- Caching for FAISS indices (based on doc URL hash) ---
-@lru_cache(maxsize=32)
-def cached_faiss_index(doc_hash, doc_type='pdf'):
-    # This is just a stub for LRU cache. Actual caching would need to be hooked for network files.
-    return None
-
-def get_hash(s):
-    import hashlib
-    return hashlib.sha256(s.encode('utf-8')).hexdigest()
-
 def build_faiss_index_from_pdf(pdf_path: str, embeddings, chunk_size: int = 1200, chunk_overlap: int = CHUNK_OVERLAP, batch_pages: int = BATCH_SIZE_PAGES, max_chunks: int = MAX_CHUNKS) -> FAISS:
     logger.info("Building FAISS index from PDF %s ...", pdf_path)
     splitter = RecursiveCharacterTextSplitter(
@@ -294,12 +292,14 @@ def build_faiss_index_from_pdf(pdf_path: str, embeddings, chunk_size: int = 1200
             if len(split_chunks) > allowed:
                 split_chunks = split_chunks[:allowed]
             if split_chunks:
-                # Batch embed instead of single call per doc
                 if faiss_index is None:
+                    logger.info("Creating initial FAISS index from %d chunks...", len(split_chunks))
                     faiss_index = FAISS.from_documents(split_chunks, embeddings)
                 else:
+                    logger.info("Adding %d chunks to FAISS index (total before add: %d).", len(split_chunks), total_chunks)
                     faiss_index.add_documents(split_chunks)
                 total_chunks += len(split_chunks)
+                logger.info("Total chunks so far: %d", total_chunks)
             batch_docs = []
             pages_in_batch = 0
         if total_chunks >= max_chunks:
@@ -313,11 +313,15 @@ def build_faiss_index_from_pdf(pdf_path: str, embeddings, chunk_size: int = 1200
             split_chunks = split_chunks[:allowed]
         if split_chunks:
             if faiss_index is None:
+                logger.info("Creating FAISS index from final batch (%d chunks)...", len(split_chunks))
                 faiss_index = FAISS.from_documents(split_chunks, embeddings)
             else:
+                logger.info("Adding final %d chunks to FAISS index.", len(split_chunks))
                 faiss_index.add_documents(split_chunks)
             total_chunks += len(split_chunks)
+    logger.info("Final total chunks: %d", total_chunks)
     if faiss_index is None:
+        logger.warning("No text extracted from PDF; creating empty FAISS index.")
         faiss_index = FAISS.from_documents([Document(page_content="")], embeddings)
     return faiss_index
 
@@ -378,6 +382,48 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         return "The policy document does not specify this clearly."
     return answer
 
+def get_flight_number() -> str:
+    try:
+        city_resp = requests.get("https://register.hackrx.in/submissions/myFavouriteCity")
+        city_resp.raise_for_status()
+        json_data = city_resp.json()
+        city = json_data.get("data", {}).get("city")
+        if not city:
+            raise HTTPException(status_code=400, detail="Could not fetch favourite city")
+        logger.info(f"Favourite city received: {city}")
+
+        landmark = city_to_landmark.get(city)
+        if not landmark:
+            raise HTTPException(status_code=400, detail=f"No landmark found for city {city}")
+        logger.info(f"Landmark for city {city}: {landmark}")
+
+        endpoint = landmark_to_endpoint.get(
+            landmark,
+            "https://register.hackrx.in/teams/public/flights/getFifthCityFlightNumber"
+        )
+
+        flight_resp = requests.get(endpoint)
+        flight_resp.raise_for_status()
+
+        try:
+            flight_json = flight_resp.json()
+            flight_number = flight_json.get("data", {}).get("flightNumber")
+        except Exception:
+            flight_number = flight_resp.text.strip()
+
+        if not flight_number:
+            raise HTTPException(status_code=400, detail="Flight number not found")
+
+        logger.info(f"Clean flight number: {flight_number}")
+        return flight_number
+
+    except requests.HTTPError as http_err:
+        logger.error(f"HTTP error occurred: {http_err}")
+        raise HTTPException(status_code=502, detail="Error contacting external API")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # -----------------------------
 # Main /hackrx/run endpoint
 # -----------------------------
@@ -387,8 +433,14 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
     logger.info("Received /hackrx/run for document: %s", data.documents)
     is_flight_question = any("flight number" in q.lower() for q in data.questions)
     if is_flight_question:
-        # Skipped for brevity; unchanged
-        pass
+        try:
+            flight_number = get_flight_number()
+            return {"status": "success", "answers": [f"Your flight number is: {flight_number}"]}
+        except HTTPException as e:
+            raise e
+        except Exception as e:
+            logger.exception("Flight number lookup failed: %s", e)
+            raise HTTPException(status_code=500, detail=f"Failed to retrieve flight number: {str(e)}")
     if HACKRX_BEARER_TOKEN:
         if not authorization or not authorization.startswith("Bearer "):
             logger.error("Missing or invalid Authorization header.")
@@ -401,8 +453,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
     vector_store: Optional[FAISS] = None
     try:
         start_time = time.time()
-        # Use async HTTP and file save
-        resp = await async_http_get(data.documents, timeout=PDF_STREAM_TIMEOUT)
+        resp = _retry_request(data.documents, stream=True, timeout=PDF_STREAM_TIMEOUT)
         content_type = detect_content_type_from_headers_or_url(resp, data.documents)
         logger.info("Remote content-type detected as: %s", content_type)
         if "text/html" in content_type or ("text" in content_type and "html" not in content_type and len(resp.content) < 200000):
@@ -432,17 +483,12 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             logger.info("Processed JSON/text endpoint into FAISS index with %d chunks", len(chunks))
         else:
             guessed_ext = mimetypes.guess_extension(content_type.split(";")[0]) or os.path.splitext(data.documents)[1] or ".bin"
-            tmp_path = await save_stream_to_tempfile_async(resp, suffix=guessed_ext)
+            tmp_path = save_stream_to_tempfile(resp, suffix=guessed_ext)
             logger.info("File saved to temporary path: %s", tmp_path)
             ext = os.path.splitext(tmp_path)[1].lower()
             logger.info("Temporary file ext determined as: %s", ext)
-            doc_hash = get_hash(data.documents)
             if ext == ".pdf":
-                # Try to use cached FAISS index
-                cached = cached_faiss_index(doc_hash, 'pdf')
-                if cached:
-                    vector_store = cached
-                else:
+                try:
                     vector_store = build_faiss_index_from_pdf(
                         pdf_path=tmp_path,
                         embeddings=embeddings,
@@ -451,6 +497,18 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                         batch_pages=BATCH_SIZE_PAGES,
                         max_chunks=MAX_CHUNKS
                     )
+                except Exception as e:
+                    logger.exception("PDF indexing failed: %s", e)
+                    try:
+                        with fitz.open(tmp_path) as pdf_doc:
+                            all_text = "\n".join([p.get_text() for p in pdf_doc])
+                            docs = [Document(page_content=all_text)]
+                            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
+                            chunks = splitter.split_documents(docs)
+                            vector_store = FAISS.from_documents(chunks[:MAX_CHUNKS], embeddings)
+                    except Exception as e2:
+                        logger.exception("Full PDF extraction fallback failed: %s", e2)
+                        raise HTTPException(status_code=500, detail="Failed to extract text from PDF.")
             elif ext in [".zip", ".rar", ".7z"]:
                 docs = []
                 try:
@@ -487,6 +545,17 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 except Exception as e:
                     logger.exception("Failed to process binary file: %s", e)
                     raise HTTPException(status_code=400, detail="Unsupported or unreadable file type.")
+        try:
+            first_doc = None
+            for k in vector_store.docstore._dict:
+                first_doc = vector_store.docstore._dict[k]
+                break
+            if first_doc and first_doc.page_content:
+                content_language = detect(first_doc.page_content)
+            else:
+                content_language = "unknown"
+        except Exception:
+            content_language = "unknown"
         tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
         normalized_answers = []
@@ -513,6 +582,9 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         except Exception:
             pass
 
+# -----------------------------
+# Health endpoint
+# -----------------------------
 @app.get("/")
 def health():
     return {"status": "API is running"}
