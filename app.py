@@ -110,11 +110,14 @@ try:
 
     prompt = PromptTemplate.from_template("""
 You are an expert assistant in insurance policy analysis.
-Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible.
-- Do not make assumptions.
-- Quote directly from the policy when possible.
-- Reply in the same language as the question, which is {language}.
+You are a precise assistant focused on extracting flight information from documents.
+Given the following context extracted from a document, answer the question as accurately and concisely as possible.
 
+- If the question is about a flight number, extract and return only the flight number exactly as it appears in the context.
+- If no flight number is found in the context, respond: "Flight number not found in the document."
+- Do not guess or make assumptions.
+- Quote directly from the context if possible.
+- Reply in the same language as the question, which is {language}.
 Context:
 {context}
 
