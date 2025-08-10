@@ -403,7 +403,7 @@ landmark_to_endpoint = {
     "Big Ben": "https://register.hackrx.in/teams/public/flights/getFourthCityFlightNumber"
 }
 def get_flight_number() -> str:
-    """ Core logic to fetch the flight number. Returns the clean flight number string. """
+    """ Core logic to fetch the flight number. with city name  Returns the clean flight number string. """
     try:
         # Step 1: Fetch favourite city
         city_resp = requests.get("https://register.hackrx.in/submissions/myFavouriteCity")
