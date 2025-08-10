@@ -1,10 +1,3 @@
-Okay, I understand the constraint. You have to use the `POST /hackrx/run` endpoint with that specific JSON format.
-
-I'll modify the code to check if any of the questions in your request are asking for the flight number. If a question contains the phrase "flight number", the code will bypass the normal RAG process and instead execute the flight number logic. If not, it will run the standard RAG Q\&A.
-
-Here is the modified code with the new logic integrated directly into the `hackrx_run` endpoint.
-
-```python
 #!/usr/bin/env python3
 """ Full app.py for HackRx RAG backend (corrected) - Handles PDFs, archives, JSON/text/HTML endpoints (e.g. get-secret-token) - Streams PDFs page-by-page to limit memory usage - Builds FAISS index (incremental for large PDFs) - Uses OpenAI embeddings + ChatOpenAI - Returns {"status":"success","answers": [...]} """
 import os
@@ -56,7 +49,7 @@ if not OPENAI_API_KEY:
 HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
 # Configurable knobs
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
 BATCH_SIZE_PAGES = int(os.getenv("BATCH_SIZE_PAGES", "25"))
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "2500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
@@ -639,5 +632,3 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
 @app.get("/")
 def health():
     return {"status": "API is running"}
-
-```
