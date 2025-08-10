@@ -1,0 +1,6 @@
+{
+  "Gateway of India": "https://register.hackrx.in/teams/public/flights/getFirstCityFlightNumber",
+  "Taj Mahal": "https://register.hackrx.in/teams/public/flights/getSecondCityFlightNumber",
+  "Eiffel Tower": "https://register.hackrx.in/teams/public/flights/getThirdCityFlightNumber",
+  "Big Ben": "https://register.hackrx.in/teams/public/flights/getFourthCityFlightNumber"
+}
