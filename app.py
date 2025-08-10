@@ -1,24 +1,34 @@
 import os
-import io
 import tempfile
-import zipfile
-import mimetypes
 import requests
-import fitz  # PyMuPDF
-import docx
+import zipfile
+import rarfile
+import py7zr
 import pandas as pd
-from bs4 import BeautifulSoup
+import fitz  # PyMuPDF
+import mimetypes
+import logging
 from PIL import Image
 import pytesseract
+from bs4 import BeautifulSoup
+from typing import List, Optional
+
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+# ---------------- CONFIG ---------------- #
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+EMBEDDING_MODEL = "text-embedding-3-small"
+MODEL_NAME = "gpt-4o-mini"
+BEARER_TOKEN = os.getenv("BEARER_TOKEN", "testtoken")
 
+# ---------------- FASTAPI SETUP ---------------- #
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -28,110 +38,146 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Config ----
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("Missing OPENAI_API_KEY")
-
-embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
-
-# ---- Input schema ----
-class RunRequest(BaseModel):
+# ---------------- MODELS ---------------- #
+class HackRxRequest(BaseModel):
     documents: str
-    questions: list[str]
+    questions: List[str]
 
-# ---- File handlers ----
-def extract_text_from_pdf(file_bytes):
-    text = ""
-    pdf = fitz.open(stream=file_bytes, filetype="pdf")
-    for page in pdf:
-        page_text = page.get_text()
-        if not page_text.strip():
-            pix = page.get_pixmap()
-            img = Image.open(io.BytesIO(pix.tobytes()))
-            page_text = pytesseract.image_to_string(img)
-        text += page_text + "\n"
-    return text
+# ---------------- FILE HELPERS ---------------- #
+def download_file(url: str) -> str:
+    resp = requests.get(url, stream=True)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="Unable to download file")
+    tmp_fd, tmp_path = tempfile.mkstemp()
+    with os.fdopen(tmp_fd, "wb") as tmp_file:
+        for chunk in resp.iter_content(1024):
+            tmp_file.write(chunk)
+    return tmp_path
 
-def extract_text_from_docx(file_bytes):
-    doc = docx.Document(io.BytesIO(file_bytes))
-    return "\n".join([p.text for p in doc.paragraphs])
+def extract_text_from_pdf(path: str) -> str:
+    text = []
+    with fitz.open(path) as doc:
+        for page in doc:
+            text.append(page.get_text())
+    return "\n".join(text)
 
-def extract_text_from_txt(file_bytes):
-    return file_bytes.decode(errors="ignore")
+def extract_text_from_txt(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
 
-def extract_text_from_csv(file_bytes):
-    df = pd.read_csv(io.BytesIO(file_bytes))
+def extract_text_from_csv(path: str) -> str:
+    df = pd.read_csv(path)
     return df.to_string()
 
-def extract_text_from_html(file_bytes):
-    soup = BeautifulSoup(file_bytes, "html.parser")
-    return soup.get_text(separator="\n")
+def extract_text_from_xlsx(path: str) -> str:
+    df = pd.read_excel(path)
+    return df.to_string()
 
-def extract_from_zip(file_bytes):
-    text = ""
-    with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-        for name in z.namelist():
-            if name.endswith("/"):  # Skip folders
-                continue
-            with z.open(name) as f:
-                text += process_file(f.read(), name) + "\n"
-    return text
+def extract_text_from_html(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        soup = BeautifulSoup(f, "html.parser")
+        return soup.get_text(separator="\n")
 
-# ---- Main processing ----
-def process_file(file_bytes, filename):
-    mime_type, _ = mimetypes.guess_type(filename)
-    if not mime_type:
-        mime_type = "application/octet-stream"
+def extract_text_from_image(path: str) -> str:
+    img = Image.open(path)
+    return pytesseract.image_to_string(img)
 
-    if mime_type == "application/pdf":
-        return extract_text_from_pdf(file_bytes)
-    elif mime_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
-        return extract_text_from_docx(file_bytes)
-    elif mime_type in ["text/plain"]:
-        return extract_text_from_txt(file_bytes)
-    elif mime_type in ["text/csv", "application/vnd.ms-excel"]:
-        return extract_text_from_csv(file_bytes)
-    elif mime_type in ["text/html"]:
-        return extract_text_from_html(file_bytes)
-    elif mime_type == "application/zip":
-        return extract_from_zip(file_bytes)
+def extract_text_from_zip(path: str) -> str:
+    text = []
+    with zipfile.ZipFile(path, "r") as z:
+        for file in z.namelist():
+            with z.open(file) as f:
+                tmp = tempfile.mktemp()
+                with open(tmp, "wb") as out:
+                    out.write(f.read())
+                text.append(extract_text_by_type(tmp))
+    return "\n".join(text)
+
+def extract_text_from_rar(path: str) -> str:
+    text = []
+    with rarfile.RarFile(path) as rf:
+        for file in rf.namelist():
+            tmp = tempfile.mktemp()
+            with open(tmp, "wb") as out:
+                out.write(rf.read(file))
+            text.append(extract_text_by_type(tmp))
+    return "\n".join(text)
+
+def extract_text_from_7z(path: str) -> str:
+    text = []
+    with py7zr.SevenZipFile(path, mode="r") as z:
+        z.extractall(path=tempfile.gettempdir())
+        for root, _, files in os.walk(tempfile.gettempdir()):
+            for name in files:
+                file_path = os.path.join(root, name)
+                text.append(extract_text_by_type(file_path))
+    return "\n".join(text)
+
+def extract_text_from_bin(path: str) -> str:
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.hex()
+
+def extract_text_by_type(path: str) -> str:
+    mime_type, _ = mimetypes.guess_type(path)
+    ext = (os.path.splitext(path)[1] or "").lower()
+
+    if ext == ".pdf":
+        return extract_text_from_pdf(path)
+    elif ext == ".txt":
+        return extract_text_from_txt(path)
+    elif ext == ".csv":
+        return extract_text_from_csv(path)
+    elif ext in [".xls", ".xlsx"]:
+        return extract_text_from_xlsx(path)
+    elif ext in [".html", ".htm"]:
+        return extract_text_from_html(path)
+    elif ext in [".jpg", ".jpeg", ".png"]:
+        return extract_text_from_image(path)
+    elif ext == ".zip":
+        return extract_text_from_zip(path)
+    elif ext == ".rar":
+        return extract_text_from_rar(path)
+    elif ext == ".7z":
+        return extract_text_from_7z(path)
+    elif ext == ".bin":
+        return extract_text_from_bin(path)
     else:
-        # Try PDF fallback for wrongly named files like .bin
-        try:
-            return extract_text_from_pdf(file_bytes)
-        except Exception:
-            return ""
+        if mime_type and mime_type.startswith("text"):
+            return extract_text_from_txt(path)
+        else:
+            return extract_text_from_bin(path)
 
-def download_and_extract(url):
-    r = requests.get(url, timeout=20)
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail="File download failed")
-    filename = url.split("/")[-1]
-    return process_file(r.content, filename)
+# ---------------- RAG PIPELINE ---------------- #
+def create_faiss_index(text: str):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    docs = splitter.create_documents([text])
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    return FAISS.from_documents(docs, embeddings)
 
-# ---- Vector store creation ----
-def create_faiss_index(text):
-    docs = text.split("\n\n")
-    return FAISS.from_texts(docs, embeddings)
-
-# ---- API endpoint ----
-@app.post("/hackrx/run")
-def run(request: RunRequest, authorization: str = Header(None)):
-    if authorization != f"Bearer {os.getenv('BEARER_TOKEN')}":
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    text = download_and_extract(request.documents)
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="No readable text found in file")
-
-    index = create_faiss_index(text)
+def answer_questions(index: FAISS, questions: List[str]) -> List[str]:
+    llm = ChatOpenAI(model=MODEL_NAME, temperature=0)
     answers = []
-    for q in request.questions:
-        docs = index.similarity_search(q, k=3)
-        context = "\n".join([d.page_content for d in docs])
-        answer = llm.predict(f"Answer the question based on the following:\n{context}\n\nQ: {q}")
-        answers.append(answer)
+    for q in questions:
+        docs = index.similarity_search(q, k=4)
+        context = "\n".join(d.page_content for d in docs)
+        prompt = f"Answer the question based on the following context:\n\n{context}\n\nQuestion: {q}\nAnswer:"
+        resp = llm.invoke(prompt)
+        answers.append(resp.content.strip())
+    return answers
+
+# ---------------- ROUTES ---------------- #
+@app.post("/hackrx/run")
+def run_hackrx(req: HackRxRequest, authorization: Optional[str] = Header(None)):
+    if authorization != f"Bearer {BEARER_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    file_path = download_file(req.documents)
+    text = extract_text_by_type(file_path)
+    index = create_faiss_index(text)
+    answers = answer_questions(index, req.questions)
 
     return {"answers": answers}
