@@ -369,7 +369,7 @@ def find_token_in_docs(docs: List[Document]) -> Optional[str]:
     return None
 
 # -----------------------------
-# === Added: Flight number extraction helper ===
+# === Added: Flight & City extraction helpers ===
 # -----------------------------
 def extract_flight_number_from_docs(docs: List[Document]) -> Optional[str]:
     """
@@ -382,18 +382,56 @@ def extract_flight_number_from_docs(docs: List[Document]) -> Optional[str]:
     combined = " ".join(d.page_content for d in docs if getattr(d, "page_content", None))
     # common flight number patterns: [A-Z]{1,3}-?\d{1,4}
     pattern = re.compile(r"\b([A-Z]{1,3}-?\d{2,4})\b")
-    # search for likely candidates but try to avoid matching things like "I-95" (rudimentary)
     matches = pattern.findall(combined)
     if not matches:
         return None
-    # simple heuristics: prefer those with letters followed by numbers, and not purely uppercase words
+    # heuristics: prefer matches that are letters+digits (not pure words)
     for m in matches:
-        # ignore purely alphabetic strings
-        if re.fullmatch(r"[A-Z]{2,}", m):
-            continue
-        # ignore matches that look like page numbers like "P.123" already filtered by pattern
-        return m
+        if re.fullmatch(r"[A-Z]{1,3}\d{2,4}", m) or re.fullmatch(r"[A-Z]{1,3}-\d{2,4}", m):
+            return m
     return matches[0] if matches else None
+
+def extract_city_from_docs(docs: List[Document]) -> Optional[str]:
+    """
+    Heuristic extraction of a city mention from document list.
+    Looks for phrases like 'favorite city', 'city:', 'preferred city', or 'in <City>'.
+    """
+    if not docs:
+        return None
+    combined = " ".join(d.page_content for d in docs if getattr(d, "page_content", None))
+    # common patterns
+    patterns = [
+        r"(?:favorite|favourite|preferred|preferred\s+destination)\s+city\s*[:\-]?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)",
+        r"\bcity\s*[:\-]\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)",
+        r"\bin\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\b"
+    ]
+    for pat in patterns:
+        m = re.search(pat, combined, flags=re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            # filter out very short or unlikely matches
+            if len(candidate) > 1 and not re.search(r"\d", candidate):
+                return candidate
+    return None
+
+def find_flight_near_city(combined_text: str, city: str) -> Optional[str]:
+    """
+    Search for flight number occurrences located near mentions of the city.
+    """
+    if not city:
+        return None
+    # normalize
+    city_regex = re.escape(city)
+    # search windows around city mentions
+    for match in re.finditer(city_regex, combined_text, flags=re.IGNORECASE):
+        start = max(0, match.start() - 200)
+        end = min(len(combined_text), match.end() + 200)
+        window = combined_text[start:end]
+        # flight pattern
+        fmatch = re.search(r"\b([A-Z]{1,3}-?\d{2,4})\b", window)
+        if fmatch:
+            return fmatch.group(1)
+    return None
 
 # -----------------------------
 # Async QA helper (with token & flight shortcuts)
@@ -402,16 +440,17 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
     """
     If question asks specifically for a 'secret token' or 'token', try to find it
     directly from the indexed documents before calling the LLM.
-    If question asks for flight number, try to extract from docs first.
+    If question asks for flight number, try to extract from docs first (directly or via city proximity).
     Otherwise, run RAG + chain.
     """
     q_lower = question.lower()
 
     # --- Special: flight number shortcut ---
-    if "flight number" in q_lower or "what is my flight number" in q_lower or "what's my flight number" in q_lower:
+    if "flight number" in q_lower or "what is my flight number" in q_lower or "what's my flight number" in q_lower \
+       or re.search(r"\bflight\b", q_lower):
         docs_list = []
         try:
-            # try to pull existing stored docs from vector_store
+            # try to pull stored docs from vector_store's docstore (fast)
             for v in vector_store.docstore._dict.values():
                 docs_list.append(v)
         except Exception:
@@ -421,10 +460,70 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
             except Exception:
                 docs_list = []
 
+        # 1) direct flight number extraction
         found_flight = extract_flight_number_from_docs(docs_list)
         if found_flight:
             return found_flight
-        # if not found, continue to token/normal flow (it will fall back to LLM)
+
+        # 2) try to get a city mention and look nearby for flight numbers
+        combined_text = " ".join(d.page_content for d in docs_list if getattr(d, "page_content", None))
+        city = extract_city_from_docs(docs_list)
+        if city:
+            flight_near_city = find_flight_near_city(combined_text, city)
+            if flight_near_city:
+                return flight_near_city
+
+        # 3) if not found through heuristics, attempt a contextual search (pull top docs and ask chain to extract)
+        try:
+            # retrieve broader set and ask the chain to answer directly (still RAG but focused)
+            top_docs = vector_store.similarity_search("flight number city landmark", k=10)
+            # craft a small prompt to instruct chain to extract flight number and city explicitly
+            small_prompt = PromptTemplate.from_template("""
+You are an assistant that extracts factual values from the provided document snippets.
+Return a JSON object with keys: "city" and "flight_number". If a value isn't present, use null.
+Snippets:
+{context}
+Return only valid JSON.
+""")
+            # use chain to extract
+            raw = await chain.ainvoke({
+                "context": top_docs,
+                "input": "",
+                "language": "en",
+                "prompt": small_prompt
+            })
+            # raw might be dict or string; attempt to parse JSON
+            if isinstance(raw, dict):
+                # try common fields
+                for key in ("output_text", "answer", "text", "response", "content"):
+                    if key in raw and isinstance(raw[key], str) and raw[key].strip():
+                        raw_text = raw[key].strip()
+                        break
+                else:
+                    raw_text = json.dumps(raw, ensure_ascii=False)
+            elif isinstance(raw, str):
+                raw_text = raw.strip()
+            else:
+                raw_text = str(raw).strip()
+            # attempt to parse json from the chain
+            try:
+                parsed = json.loads(raw_text)
+                if isinstance(parsed, dict):
+                    if parsed.get("flight_number"):
+                        return str(parsed.get("flight_number"))
+                    # try city then search near city
+                    parsed_city = parsed.get("city")
+                    if parsed_city:
+                        f_near = find_flight_near_city(combined_text, parsed_city)
+                        if f_near:
+                            return f_near
+            except Exception:
+                # not JSON or parse failed; fall back to normal chain below
+                pass
+        except Exception as e:
+            logger.debug("Chain-based extraction for flight failed: %s", e)
+        # if all heuristics fail, fall through to RAG chain (which may answer)
+        # Note: we intentionally don't return an error here; we let the chain handle it below.
 
     # If question explicitly asks to "get the secret token" or "return the token", search docs.
     if any(phrase in q_lower for phrase in ["secret token", "get the token", "return the token", "secret-token", "get-secret"]):
