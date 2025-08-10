@@ -50,6 +50,18 @@ from langchain.document_loaders import (
     UnstructuredFileLoader, TextLoader,
     UnstructuredEmailLoader, UnstructuredImageLoader
 )
+import re
+
+FLIGHT_REGEX = re.compile(r"\b[A-Z]{2}\d{3,4}\b")
+
+def extract_flight_number_from_docs(docs: List[Document]) -> Optional[str]:
+    for doc in docs:
+        if not doc or not doc.page_content:
+            continue
+        matches = FLIGHT_REGEX.findall(doc.page_content)
+        if matches:
+            return matches[0]  # Return first flight number found
+    return None
 
 # -----------------------------
 # Load environment and config
@@ -375,21 +387,15 @@ def find_token_in_docs(docs: List[Document]) -> Optional[str]:
 # Async QA helper (with token shortcut)
 # -----------------------------
 async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
-    """
-    If question asks specifically for a 'secret token' or 'token', try to find it
-    directly from the indexed documents before calling the LLM.
-    Otherwise, run RAG + chain.
-    """
     q_lower = question.lower()
+
     # If question explicitly asks to "get the secret token" or "return the token", search docs.
     if any(phrase in q_lower for phrase in ["secret token", "get the token", "return the token", "secret-token", "get-secret"]):
-        # grab stored docs from vector_store
         docs_list = []
         try:
             for v in vector_store.docstore._dict.values():
                 docs_list.append(v)
         except Exception:
-            # fallback to similarity search across a simple query to pull some docs
             try:
                 docs_list = vector_store.similarity_search("token", k=10)
             except Exception:
@@ -399,7 +405,7 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         if found:
             return found
 
-    # Fall back to normal retrieval + chain
+    # Run original retrieval + LLM chain
     try:
         lang = detect(question)
     except Exception:
@@ -421,24 +427,28 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         "language": lang
     })
 
-    # chain.ainvoke may return a dict or string depending on chain implementation
     if isinstance(raw, dict):
-        # common fields: 'text', 'answer', 'output_text'
         for key in ("output_text", "answer", "text", "response", "content"):
             if key in raw and isinstance(raw[key], str) and raw[key].strip():
                 answer = raw[key].strip()
                 break
         else:
-            # fallback to json dump
             answer = json.dumps(raw, ensure_ascii=False)
     elif isinstance(raw, str):
         answer = raw.strip()
     else:
         answer = str(raw).strip()
 
+    # If answer negative or no flight number found, fallback to regex
+    if "not found" in answer.lower() and ("flight number" in question.lower()):
+        flight_num = extract_flight_number_from_docs(docs)
+        if flight_num:
+            return flight_num
+
     if not answer or "i don't know" in answer.lower():
         return "The policy document does not specify this clearly."
     return answer
+
 
 # -----------------------------
 # Main /hackrx/run endpoint
