@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Full app.py for HackRx RAG backend (corrected)
-- Handles PDFs, archives, JSON/text/HTML endpoints (e.g. get-secret-token)
+Full app.py for HackRx RAG backend (updated)
+- Keeps your original PDF / archive / HTML / JSON handling
 - Streams PDFs page-by-page to limit memory usage
 - Builds FAISS index (incremental for large PDFs)
 - Uses OpenAI embeddings + ChatOpenAI
+- Behavior for flight-number questions:
+    1) Ask the QA chain (GPT) first.
+    2) If GPT returns a plausible flight number, use it.
+    3) Otherwise automatically follow the PDF's flow:
+       - call /submissions/myFavouriteCity to get the city
+       - map city -> landmark by extracting mapping from the PDF text
+       - call the correct flights endpoint per the PDF instructions
 - Returns {"status":"success","answers": [...]}
 """
 
@@ -400,7 +407,6 @@ def extract_city_landmark_map_from_text(raw_text: str) -> Dict[str, str]:
                     mapping[city.lower()] = landmark
                     continue
         # Otherwise try rsplit once: last word(s) likely the city
-        # If last token is a single capitalized token or two tokens, accept
         parts = ln_clean.rsplit(' ', 1)
         if len(parts) == 2:
             maybe_landmark, maybe_city = parts[0].strip(), parts[1].strip()
@@ -434,7 +440,8 @@ def choose_flight_endpoint_for_landmark(landmark: str) -> str:
     if not landmark:
         return base + "getFifthCityFlightNumber"
     key = landmark.strip().lower()
-    if "gateway of india" in key or "gateway" in key and "india" in key:
+    # Compound logical checks grouped to avoid precedence surprises
+    if ("gateway of india" in key) or ("gateway" in key and "india" in key):
         return base + "getFirstCityFlightNumber"
     if "taj mahal" in key or "taj" in key:
         return base + "getSecondCityFlightNumber"
@@ -459,7 +466,7 @@ def read_pdf_full_text(pdf_path: str) -> str:
         return ""
 
 # -----------------------------
-# Async QA helper (with token shortcut) -- unchanged
+# Async QA helper (with token shortcut)
 # -----------------------------
 async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
     """
@@ -528,7 +535,34 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
     return answer
 
 # -----------------------------
-# Main /hackrx/run endpoint (modified to auto-handle flight-number questions)
+# Utility: validate whether a GPT answer looks like a plausible flight number
+# -----------------------------
+def is_plausible_flight_number(s: str) -> Optional[str]:
+    """
+    Heuristic: return a plausible token if present in s.
+    Accepts simple alphanumeric sequences of length >=2, commonly flight numbers are alnum.
+    If no plausible token, return None.
+    """
+    if not s:
+        return None
+    # common patterns: letters+digits (e.g., "AA123"), or single alphanumeric token
+    # We'll look for the first token with letters or digits of length >=2
+    m = re.search(r"\b[A-Za-z0-9][A-Za-z0-9_\-]{1,}\b", s)
+    if m:
+        token = m.group(0).strip()
+        # additional sanity: avoid returning generic words like "flight" or "number"
+        if re.search(r"flight|number|the|is|please", token, re.IGNORECASE):
+            # try to search for the next candidate
+            for mm in re.finditer(r"\b[A-Za-z0-9][A-Za-z0-9_\-]{1,}\b", s):
+                tok = mm.group(0).strip()
+                if not re.search(r"flight|number|the|is|please", tok, re.IGNORECASE):
+                    return tok
+            return None
+        return token
+    return None
+
+# -----------------------------
+# Main /hackrx/run endpoint (updated: GPT-first for flight-number Qs)
 # -----------------------------
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None), request: Request = None):
@@ -675,58 +709,95 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
             content_language = "unknown"
 
         # ---------------------------------------------------------------------
-        # Special-case: if any question asks for a "flight number", handle automatically
+        # Special-case: flight-number questions: GPT-first, then auto-fetch if GPT fails
         # ---------------------------------------------------------------------
-        flight_answers: Dict[int, str] = {}
+        answers = [None] * len(data.questions)
+
+        # Identify flight-related question indices
         flight_question_indices: List[int] = []
+        non_flight_question_indices: List[int] = []
         for idx, q in enumerate(data.questions):
             if re.search(r"\bflight\s*number\b|\bflight\b|\bflight-number\b", q, re.IGNORECASE):
                 flight_question_indices.append(idx)
+            else:
+                non_flight_question_indices.append(idx)
 
-        if flight_question_indices:
-            # Attempt automatic flow for flight number questions
+        # 1) Ask GPT for all questions (we need GPT answers for flight-questions first)
+        # Prepare tasks for GPT for flight questions (and optionally other questions together)
+        # We'll ask GPT for flight questions first, to obey "letting GPT try first"
+        gpt_tasks = []
+        gpt_indices = []
+        for idx in flight_question_indices:
+            gpt_tasks.append(ask_async_chain(qa_chain, vector_store, data.questions[idx].strip()))
+            gpt_indices.append(idx)
+
+        # Run GPT for flight questions
+        gpt_results = []
+        if gpt_tasks:
+            gpt_results = await asyncio.gather(*gpt_tasks)
+
+        # Evaluate GPT results for plausibility
+        flight_answers: Dict[int, str] = {}
+        unresolved_flight_indices: List[int] = []
+        for idx, res in zip(gpt_indices, gpt_results):
+            res_text = None
+            if isinstance(res, dict):
+                for key in ("output_text", "answer", "text", "response", "content"):
+                    if key in res and isinstance(res[key], str) and res[key].strip():
+                        res_text = res[key].strip()
+                        break
+                if res_text is None:
+                    res_text = json.dumps(res, ensure_ascii=False)
+            else:
+                res_text = str(res).strip()
+
+            plausible = is_plausible_flight_number(res_text)
+            if plausible:
+                flight_answers[idx] = f"Flight number: {plausible}"
+                logger.info("GPT-provided plausible flight for question %d: %s", idx, plausible)
+            else:
+                # keep GPT response as initial (for transparency), but mark unresolved to auto-fetch
+                logger.info("GPT response not a plausible flight (question %d): %s", idx, res_text)
+                unresolved_flight_indices.append(idx)
+
+        # 2) For unresolved flight questions, perform automatic flow using PDF instructions
+        if unresolved_flight_indices:
             try:
-                # 1) call favourite city endpoint
+                # 2a) Get favourite city
                 fav_city_url = "https://register.hackrx.in/submissions/myFavouriteCity"
                 logger.info("Querying favourite city endpoint: %s", fav_city_url)
                 fav_resp = _retry_request(fav_city_url, stream=False, timeout=15)
                 fav_resp.raise_for_status()
                 try:
                     fav_json = fav_resp.json()
-                    # attempt to read common keys
+                    fav_city = None
                     if isinstance(fav_json, dict):
-                        # try typical keys or assume the value itself is the city
-                        fav_city = None
                         for key in ("city", "favouriteCity", "favoriteCity", "myFavouriteCity", "myFavoriteCity", "data"):
-                            if key in fav_json and isinstance(fav_json[key], str):
-                                fav_city = fav_json[key]
+                            if key in fav_json and isinstance(fav_json[key], str) and fav_json[key].strip():
+                                fav_city = fav_json[key].strip()
                                 break
                         if fav_city is None:
-                            # maybe the response is {"city": {"name": "Chennai"}} or similar
-                            # try to find any string value
+                            # find any string value
                             for v in fav_json.values():
                                 if isinstance(v, str) and v.strip():
-                                    fav_city = v
+                                    fav_city = v.strip()
                                     break
                     else:
-                        # if response not a dict, treat as plain text
                         fav_city = str(fav_json).strip()
                 except Exception:
                     fav_city = fav_resp.text.strip()
 
-                # Normalise city
                 fav_city_simple = (fav_city or "").strip().strip('"').strip("'")
                 logger.info("Favourite city from API: %s", fav_city_simple)
 
-                # 2) if we have PDF full text, extract mapping
-                city_landmark_map = {}
+                # 2b) Build mapping city -> landmark from PDF full text first
+                city_landmark_map: Dict[str, str] = {}
                 if pdf_full_text:
                     city_landmark_map = extract_city_landmark_map_from_text(pdf_full_text)
                     logger.info("Extracted %d city->landmark entries from PDF pre-scan", len(city_landmark_map))
 
-                # 3) If mapping empty (or didn't include the favorite), attempt to extract from vector_store docs
+                # 2c) If mapping is missing or doesn't include the favorite, try to extract from vector_store docs
                 if (not city_landmark_map) or (fav_city_simple and fav_city_simple.lower() not in city_landmark_map):
-                    # Try to reconstruct full text from vector store docstore
                     try:
                         vs_text_parts = []
                         for v in vector_store.docstore._dict.values():
@@ -744,12 +815,11 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                     except Exception as e:
                         logger.debug("Could not construct mapping from vector_store: %s", e)
 
-                # 4) Find the landmark for the favorite city
+                # 2d) Determine landmark for favourite city
                 landmark = None
                 if fav_city_simple:
                     landmark = city_landmark_map.get(fav_city_simple.lower())
-                if not landmark:
-                    # try fuzzy search: check substring matches
+                if not landmark and fav_city_simple:
                     lowered = fav_city_simple.lower()
                     for city_key, lm in city_landmark_map.items():
                         if lowered and lowered in city_key:
@@ -757,71 +827,57 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                             break
                 logger.info("Pre-scan found city=%s landmark=%s", fav_city_simple or None, landmark or None)
 
-                # 5) pick endpoint for landmark (per PDF instructions) and call it
-                flight_number_result = None
+                # 2e) Choose endpoint and call it
                 flight_endpoint_url = choose_flight_endpoint_for_landmark(landmark or "")
                 logger.info("Calling flight endpoint: %s", flight_endpoint_url)
+                flight_number_result = None
                 try:
                     flight_resp = _retry_request(flight_endpoint_url, stream=False, timeout=15)
                     flight_resp.raise_for_status()
-                    # attempt to parse JSON first
+                    # parse JSON if possible
                     try:
                         frj = flight_resp.json()
-                        # try to find any string/number value that looks like a flight
                         if isinstance(frj, dict):
                             for val in frj.values():
                                 if isinstance(val, (str, int)) and str(val).strip():
                                     flight_number_result = str(val).strip()
                                     break
                             if not flight_number_result:
-                                # maybe nested
-                                s = json.dumps(frj)
-                                flight_number_result = s.strip()
+                                flight_number_result = json.dumps(frj, ensure_ascii=False).strip()
                         else:
                             flight_number_result = str(frj).strip()
                     except Exception:
-                        # fallback to text
                         flight_text = flight_resp.text.strip()
                         flight_number_result = flight_text
                 except Exception as e:
                     logger.warning("Flight endpoint call failed: %s", e)
                     flight_number_result = None
 
-                # 6) Clean up flight_number_result heuristically
+                final_flight = None
                 if flight_number_result:
-                    # extract plausible flight-like token: alphanumeric sequence or word
                     m = re.search(r"[A-Za-z0-9_\-]{2,}", flight_number_result)
                     if m:
                         final_flight = m.group(0)
                     else:
                         final_flight = flight_number_result.strip()
-                else:
-                    final_flight = None
 
-                # Compose answers for all flight-question indices
-                for idx in flight_question_indices:
+                for idx in unresolved_flight_indices:
                     if final_flight:
-                        ans = f"Flight number: {final_flight}"
+                        flight_answers[idx] = f"Flight number: {final_flight}"
                     else:
-                        ans = "Could not retrieve flight number automatically."
-                    flight_answers[idx] = ans
+                        flight_answers[idx] = "Could not retrieve flight number automatically."
 
             except Exception as e:
                 logger.exception("Automatic flight-number flow failed: %s", e)
-                # leave flight_answers empty and fall back to RAG for those questions
+                # If everything fails, leave unresolved to be answered by RAG below
 
-        # ---------------------------------------------------------------------
-        # Answer remaining questions (or all) via RAG chain as before
-        # ---------------------------------------------------------------------
-        # For questions that were handled by automatic flight flow, keep the answer
-        # For others call the chain
-        answers = [None] * len(data.questions)
-
-        # Fill any flight answers we computed
+        # Place flight answers into final answers array
         for idx, ans in flight_answers.items():
             answers[idx] = ans
 
-        # For questions not yet answered, run RAG concurrently
+        # ---------------------------------------------------------------------
+        # For all remaining unanswered questions, use the RAG chain (GPT)
+        # ---------------------------------------------------------------------
         pending_tasks = []
         pending_indices = []
         for idx, q in enumerate(data.questions):
@@ -839,7 +895,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 else:
                     answers[idx] = str(res).strip()
 
-        # Ensure answers array fully populated
+        # Final normalization
         normalized_answers = [ (a if isinstance(a, str) else str(a)) for a in answers ]
 
         for q, a in zip(data.questions, normalized_answers):
