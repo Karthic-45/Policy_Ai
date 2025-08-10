@@ -5,7 +5,6 @@ langchain>=0.2.0
 langchain-core
 langchain-openai
 langchain-community
-langchain-unstructured
 openai
 faiss-cpu
 pandas
