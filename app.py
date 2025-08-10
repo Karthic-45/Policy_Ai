@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-""" Full app.py for HackRx RAG backend (corrected) - Handles PDFs, archives, JSON/text/HTML endpoints (e.g. get-secret-token) - Streams PDFs page-by-page to limit memory usage - Builds FAISS index (incremental for large PDFs) - Uses OpenAI embeddings + ChatOpenAI - Returns {"status":"success","answers": [...]} """
 import os
 import re
 import time
@@ -13,31 +12,30 @@ import asyncio
 from typing import List, Optional, Iterable
 from functools import partial
 import requests
-import fitz # PyMuPDF
+import fitz  # PyMuPDF
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from langdetect import detect # LangChain / OpenAI
+from langdetect import detect
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-# Archive libs & other helpers
 import rarfile
 import py7zr
 import pandas as pd
 from PIL import Image
-# Optional unstructured loaders (may warn if package not installed)
 from langchain.document_loaders import (
     UnstructuredFileLoader,
     TextLoader,
     UnstructuredEmailLoader,
-    UnstructuredImageLoader
+    UnstructuredImageLoader,
 )
+
 # -----------------------------
 # Load environment and config
 # -----------------------------
@@ -45,9 +43,8 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY must be set in environment variables.")
-# Optional auth token for incoming requests
+
 HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
-# Configurable knobs
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
 BATCH_SIZE_PAGES = int(os.getenv("BATCH_SIZE_PAGES", "25"))
@@ -57,50 +54,81 @@ MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "50"))
 PDF_STREAM_TIMEOUT = int(os.getenv("PDF_STREAM_TIMEOUT", "60"))
 DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "2"))
 DOWNLOAD_BACKOFF = float(os.getenv("DOWNLOAD_BACKOFF", "0.8"))
+CORS_ORIGINS = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
+
+CITY_LANDMARKS_FILE = os.getenv("CITY_LANDMARKS_FILE", "city_to_landmark.json")
+LANDMARK_ENDPOINTS_FILE = os.getenv("LANDMARK_ENDPOINTS_FILE", "landmark_to_endpoint.json")
+PROMPT_FILE = os.getenv("PROMPT_FILE", "prompt.txt")
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-# Ensure OpenAI key available to libs that use env var
+
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+def load_json_file(file_path, default=None):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning("Failed to load JSON file %s: %s", file_path, e)
+        return default or {}
+
+def load_prompt_template(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        logger.warning("Failed to load prompt template from %s: %s", file_path, e)
+        # fallback to a reasonable default
+        return """
+You are an expert assistant in insurance policy analysis.
+Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible.
+- Do not make assumptions.
+- Quote directly from the policy when possible.
+- Reply in the same language as the question, which is {language}.
+Context: {context}
+Question: {input}
+Answer:
+"""
+
+city_to_landmark = load_json_file(CITY_LANDMARKS_FILE, {})
+landmark_to_endpoint = load_json_file(LANDMARK_ENDPOINTS_FILE, {})
+prompt_template_str = load_prompt_template(PROMPT_FILE)
+
 # -----------------------------
 # FastAPI app setup
 # -----------------------------
 app = FastAPI(title="HackRx Insurance Q&A API", version="1.0.2")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # allow all for dev; restrict in prod
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # -----------------------------
 # Request model
 # -----------------------------
 class HackRxRequest(BaseModel):
     documents: str
     questions: List[str]
+
 # -----------------------------
 # Model initialization
 # -----------------------------
 try:
     logger.info("Initializing embeddings and LLM...")
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL) # uses env OPENAI_API_KEY
-    llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.1) # uses env OPENAI_API_KEY
-    prompt = PromptTemplate.from_template("""
-        You are an expert assistant in insurance policy analysis.
-        Use the following extracted context from an insurance document to answer the question as accurately and concisely as possible.
-        - Do not make assumptions.
-        - Quote directly from the policy when possible.
-        - Reply in the same language as the question, which is {language}.
-        Context: {context}
-        Question: {input}
-        Answer:
-    """)
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    llm = ChatOpenAI(model_name=CHAT_MODEL, temperature=0.1)
+    prompt = PromptTemplate.from_template(prompt_template_str)
     qa_chain = create_stuff_documents_chain(llm, prompt)
     logger.info("Models initialized successfully.")
 except Exception as e:
     logger.exception("Failed to initialize models: %s", e)
     raise
+
 # -----------------------------
 # Helper functions
 # -----------------------------
@@ -118,6 +146,7 @@ def _retry_request(url: str, stream: bool = False, timeout: int = 30) -> request
             time.sleep(DOWNLOAD_BACKOFF * (2 ** attempt))
     logger.error("All download attempts failed for %s", url)
     raise last_exc
+
 def detect_content_type_from_headers_or_url(resp: requests.Response, url: str) -> str:
     ctype = (resp.headers.get("content-type") or "").lower()
     if not ctype or ctype == "application/octet-stream":
@@ -125,21 +154,18 @@ def detect_content_type_from_headers_or_url(resp: requests.Response, url: str) -
         if guessed:
             ctype = guessed
     return ctype or "application/octet-stream"
+
 def extract_text_from_html(html: str) -> str:
-    """
-    Extract visible text and token-like strings from HTML.
-    Returns token candidates first (if any) followed by visible text.
-    """
     soup = BeautifulSoup(html, "html.parser")
     for el in soup(["script", "style", "noscript"]):
         el.decompose()
     visible = soup.get_text(separator="\n")
-    # find long hex-like tokens or long alphanumeric tokens typical for secret tokens
     tokens = re.findall(r"[A-Fa-f0-9]{16,}|[A-Za-z0-9_\-]{16,}", visible)
     if tokens:
         candidate_text = "\n".join(tokens)
         return candidate_text + "\n\n" + visible
     return visible
+
 def save_stream_to_tempfile(resp: requests.Response, suffix: str = "") -> str:
     tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
@@ -156,9 +182,7 @@ def save_stream_to_tempfile(resp: requests.Response, suffix: str = "") -> str:
         except Exception:
             pass
         raise
-# -----------------------------
-# Document loaders & extractors
-# -----------------------------
+
 def load_non_pdf(file_path: str) -> List[Document]:
     ext = os.path.splitext(file_path)[1].lower()
     try:
@@ -207,6 +231,7 @@ def load_non_pdf(file_path: str) -> List[Document]:
     except Exception as e:
         logger.warning("Non-PDF loader failed for %s: %s", file_path, e)
         return []
+
 def iter_pdf_pages_as_documents(pdf_path: str) -> Iterable[Document]:
     logger.info("Streaming PDF pages from %s", pdf_path)
     doc = fitz.open(pdf_path)
@@ -221,6 +246,7 @@ def iter_pdf_pages_as_documents(pdf_path: str) -> Iterable[Document]:
             yield Document(page_content=text, metadata=meta)
     finally:
         doc.close()
+
 def extract_and_load(file_path: str, archive_class) -> List[Document]:
     docs: List[Document] = []
     with tempfile.TemporaryDirectory() as extract_dir:
@@ -241,9 +267,7 @@ def extract_and_load(file_path: str, archive_class) -> List[Document]:
                 else:
                     docs.extend(load_non_pdf(full_path))
     return docs
-# -----------------------------
-# FAISS builder (incremental)
-# -----------------------------
+
 def build_faiss_index_from_pdf(pdf_path: str, embeddings, chunk_size: int = 1200, chunk_overlap: int = CHUNK_OVERLAP, batch_pages: int = BATCH_SIZE_PAGES, max_chunks: int = MAX_CHUNKS) -> FAISS:
     logger.info("Building FAISS index from PDF %s ...", pdf_path)
     splitter = RecursiveCharacterTextSplitter(
@@ -300,42 +324,25 @@ def build_faiss_index_from_pdf(pdf_path: str, embeddings, chunk_size: int = 1200
         logger.warning("No text extracted from PDF; creating empty FAISS index.")
         faiss_index = FAISS.from_documents([Document(page_content="")], embeddings)
     return faiss_index
-# -----------------------------
-# Helper: find token-like strings inside docs
-# -----------------------------
+
 def find_token_in_docs(docs: List[Document]) -> Optional[str]:
-    """
-    Search documents for token-like strings (hex or long alphanumerics).
-    Return the first match or None.
-    """
     token_pattern = re.compile(r"[A-Fa-f0-9]{16,}|[A-Za-z0-9_\-]{16,}")
     for d in docs:
         if not d or not d.page_content:
             continue
         for m in token_pattern.findall(d.page_content):
-            # filter out very common words by requiring mixed characters or digits count
             if len(m) >= 16:
                 return m
     return None
-# -----------------------------
-# Async QA helper (with token shortcut)
-# -----------------------------
+
 async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
-    """
-    If question asks specifically for a 'secret token' or 'token',
-    try to find it directly from the indexed documents before calling the LLM.
-    Otherwise, run RAG + chain.
-    """
     q_lower = question.lower()
-    # If question explicitly asks to "get the secret token" or "return the token", search docs.
     if any(phrase in q_lower for phrase in ["secret token", "get the token", "return the token", "secret-token", "get-secret"]):
-        # grab stored docs from vector_store
         docs_list = []
         try:
             for v in vector_store.docstore._dict.values():
                 docs_list.append(v)
         except Exception:
-            # fallback to similarity search across a simple query to pull some docs
             try:
                 docs_list = vector_store.similarity_search("token", k=10)
             except Exception:
@@ -343,7 +350,6 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         found = find_token_in_docs(docs_list)
         if found:
             return found
-    # Fall back to normal retrieval + chain
     try:
         lang = detect(question)
     except Exception:
@@ -361,15 +367,12 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
         "input": question,
         "language": lang
     })
-    # chain.ainvoke may return a dict or string depending on chain implementation
     if isinstance(raw, dict):
-        # common fields: 'text', 'answer', 'output_text'
         for key in ("output_text", "answer", "text", "response", "content"):
             if key in raw and isinstance(raw[key], str) and raw[key].strip():
                 answer = raw[key].strip()
                 break
         else:
-            # fallback to json dump
             answer = json.dumps(raw, ensure_ascii=False)
     elif isinstance(raw, str):
         answer = raw.strip()
@@ -378,34 +381,9 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
     if not answer or "i don't know" in answer.lower():
         return "The policy document does not specify this clearly."
     return answer
-# --- Flight Number Logic (Refactored into a function) ---
-# Cleaned city → landmark mapping (no duplicates)
-city_to_landmark = {
-    "Delhi": "Gateway of India", "Mumbai": "India Gate", "Chennai": "Charminar",
-    "Hyderabad": "Marina Beach", "Ahmedabad": "Howrah Bridge", "Mysuru": "Golconda Fort",
-    "Kochi": "Qutub Minar", "Pune": "Meenakshi Temple", "Nagpur": "Lotus Temple",
-    "Chandigarh": "Mysore Palace", "Kerala": "Rock Garden", "Bhopal": "Victoria Memorial",
-    "Varanasi": "Vidhana Soudha", "Jaisalmer": "Sun Temple", "New York": "Eiffel Tower",
-    "London": "Statue of Liberty", "Tokyo": "Big Ben", "Beijing": "Colosseum",
-    "Bangkok": "Christ the Redeemer", "Toronto": "Burj Khalifa", "Dubai": "CN Tower",
-    "Amsterdam": "Petronas Towers", "Cairo": "Leaning Tower of Pisa", "San Francisco": "Mount Fuji",
-    "Berlin": "Niagara Falls", "Barcelona": "Louvre Museum", "Moscow": "Stonehenge",
-    "Seoul": "Sagrada Familia", "Cape Town": "Acropolis", "Istanbul": "Big Ben",
-    "Riyadh": "Machu Picchu", "Paris": "Taj Mahal", "Dubai Airport": "Moai Statues",
-    "Singapore": "Christchurch Cathedral", "Jakarta": "The Shard", "Vienna": "Blue Mosque",
-    "Kathmandu": "Neuschwanstein Castle", "Los Angeles": "Buckingham Palace",
-}
-# Landmark → Flight API mapping
-landmark_to_endpoint = {
-    "Gateway of India": "https://register.hackrx.in/teams/public/flights/getFirstCityFlightNumber",
-    "Taj Mahal": "https://register.hackrx.in/teams/public/flights/getSecondCityFlightNumber",
-    "Eiffel Tower": "https://register.hackrx.in/teams/public/flights/getThirdCityFlightNumber",
-    "Big Ben": "https://register.hackrx.in/teams/public/flights/getFourthCityFlightNumber"
-}
+
 def get_flight_number() -> str:
-    """ Core logic to fetch the flight number. Returns the clean flight number string. """
     try:
-        # Step 1: Fetch favourite city
         city_resp = requests.get("https://register.hackrx.in/submissions/myFavouriteCity")
         city_resp.raise_for_status()
         json_data = city_resp.json()
@@ -414,19 +392,16 @@ def get_flight_number() -> str:
             raise HTTPException(status_code=400, detail="Could not fetch favourite city")
         logger.info(f"Favourite city received: {city}")
 
-        # Step 2: Map city to landmark
         landmark = city_to_landmark.get(city)
         if not landmark:
             raise HTTPException(status_code=400, detail=f"No landmark found for city {city}")
         logger.info(f"Landmark for city {city}: {landmark}")
 
-        # Step 3: Determine endpoint
         endpoint = landmark_to_endpoint.get(
             landmark,
             "https://register.hackrx.in/teams/public/flights/getFifthCityFlightNumber"
         )
 
-        # Step 4: Fetch flight number JSON
         flight_resp = requests.get(endpoint)
         flight_resp.raise_for_status()
 
@@ -434,7 +409,6 @@ def get_flight_number() -> str:
             flight_json = flight_resp.json()
             flight_number = flight_json.get("data", {}).get("flightNumber")
         except Exception:
-            # If not JSON, just use the raw text
             flight_number = flight_resp.text.strip()
 
         if not flight_number:
@@ -451,27 +425,22 @@ def get_flight_number() -> str:
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------
-# Main /hackrx/run endpoint (MODIFIED)
+# Main /hackrx/run endpoint
 # -----------------------------
 @app.post("/hackrx/run")
 async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(None), request: Request = None):
     global qa_chain, embeddings
     logger.info("Received /hackrx/run for document: %s", data.documents)
-    
-    # --- NEW LOGIC: Check for flight number question ---
     is_flight_question = any("flight number" in q.lower() for q in data.questions)
-    
     if is_flight_question:
         try:
             flight_number = get_flight_number()
-            # Return the flight number in the expected format for the RAG endpoint
             return {"status": "success", "answers": [f"Your flight number is: {flight_number}"]}
         except HTTPException as e:
             raise e
         except Exception as e:
             logger.exception("Flight number lookup failed: %s", e)
             raise HTTPException(status_code=500, detail=f"Failed to retrieve flight number: {str(e)}")
-    # Auth check if configured (existing RAG logic)
     if HACKRX_BEARER_TOKEN:
         if not authorization or not authorization.startswith("Bearer "):
             logger.error("Missing or invalid Authorization header.")
@@ -487,8 +456,6 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         resp = _retry_request(data.documents, stream=True, timeout=PDF_STREAM_TIMEOUT)
         content_type = detect_content_type_from_headers_or_url(resp, data.documents)
         logger.info("Remote content-type detected as: %s", content_type)
-        # ... (rest of the original RAG logic) ...
-        # HTML/text endpoints (including get-secret-token)
         if "text/html" in content_type or ("text" in content_type and "html" not in content_type and len(resp.content) < 200000):
             resp_text = resp.text
             extracted_text = extract_text_from_html(resp_text)
@@ -500,7 +467,6 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 chunks = [Document(page_content=resp_text)]
             vector_store = FAISS.from_documents(chunks, embeddings)
             logger.info("Processed HTML/text endpoint into FAISS index with %d chunks", len(chunks))
-        # JSON or plain text
         elif "application/json" in content_type or "text/plain" in content_type or data.documents.lower().endswith((".json", ".txt")):
             raw_text = resp.text
             if "application/json" in content_type or data.documents.lower().endswith(".json"):
@@ -579,8 +545,6 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 except Exception as e:
                     logger.exception("Failed to process binary file: %s", e)
                     raise HTTPException(status_code=400, detail="Unsupported or unreadable file type.")
-        
-        # Language detection (best-effort)
         try:
             first_doc = None
             for k in vector_store.docstore._dict:
@@ -592,27 +556,20 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 content_language = "unknown"
         except Exception:
             content_language = "unknown"
-            
-        # Answer questions concurrently
         tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
         answers = await asyncio.gather(*tasks)
-        
-        # Ensure answers are plain strings
         normalized_answers = []
         for a in answers:
             if isinstance(a, dict):
-                # flatten small dict to a string
                 s = a.get("output_text") or a.get("answer") or a.get("text") or json.dumps(a, ensure_ascii=False)
                 normalized_answers.append(str(s).strip())
             else:
                 normalized_answers.append(str(a).strip())
-                
         for q, a in zip(data.questions, normalized_answers):
             logger.info("----- QUESTION -----\n%s\n----- ANSWER -----\n%s\n", q, a)
         total_time = time.time() - start_time
         logger.info("Processing completed in %.2f seconds.", total_time)
         return {"status": "success", "answers": normalized_answers}
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -624,7 +581,7 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
                 os.remove(tmp_path)
         except Exception:
             pass
-            
+
 # -----------------------------
 # Health endpoint
 # -----------------------------
