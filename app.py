@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from langdetect import detect # LangChain / OpenAI
-from langchain.text_splitter import RecursiveCharacterCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import PromptTemplate
@@ -378,7 +378,6 @@ async def ask_async_chain(chain, vector_store: FAISS, question: str) -> str:
     if not answer or "i don't know" in answer.lower():
         return "The policy document does not specify this clearly."
     return answer
-
 # --- Flight Number Logic (Refactored into a function) ---
 # Cleaned city → landmark mapping (no duplicates)
 city_to_landmark = {
@@ -396,7 +395,6 @@ city_to_landmark = {
     "Singapore": "Christchurch Cathedral", "Jakarta": "The Shard", "Vienna": "Blue Mosque",
     "Kathmandu": "Neuschwanstein Castle", "Los Angeles": "Buckingham Palace",
 }
-
 # Landmark → Flight API mapping
 landmark_to_endpoint = {
     "Gateway of India": "https://register.hackrx.in/teams/public/flights/getFirstCityFlightNumber",
@@ -404,7 +402,6 @@ landmark_to_endpoint = {
     "Eiffel Tower": "https://register.hackrx.in/teams/public/flights/getThirdCityFlightNumber",
     "Big Ben": "https://register.hackrx.in/teams/public/flights/getFourthCityFlightNumber"
 }
-
 def get_flight_number() -> str:
     """ Core logic to fetch the flight number. Returns the flight number string. """
     try:
@@ -416,19 +413,16 @@ def get_flight_number() -> str:
         if not city:
             raise HTTPException(status_code=400, detail="Could not fetch favourite city")
         logger.info(f"Favourite city received: {city}")
-
         # Step 2: Map city to landmark
         landmark = city_to_landmark.get(city)
         if not landmark:
             raise HTTPException(status_code=400, detail=f"No landmark found for city {city}")
         logger.info(f"Landmark for city {city}: {landmark}")
-
         # Step 3: Get flight number endpoint or default
         endpoint = landmark_to_endpoint.get(
             landmark,
             "https://register.hackrx.in/teams/public/flights/getFifthCityFlightNumber"
         )
-
         # Step 4: Fetch flight number
         flight_resp = requests.get(endpoint)
         flight_resp.raise_for_status()
@@ -439,14 +433,12 @@ def get_flight_number() -> str:
             raise HTTPException(status_code=400, detail="Flight number not found")
             
         return flight_number
-
     except requests.HTTPError as http_err:
         logger.error(f"HTTP error occurred: {http_err}")
         raise HTTPException(status_code=502, detail="Error contacting external API")
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 # -----------------------------
 # Main /hackrx/run endpoint (MODIFIED)
 # -----------------------------
@@ -468,7 +460,6 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         except Exception as e:
             logger.exception("Flight number lookup failed: %s", e)
             raise HTTPException(status_code=500, detail=f"Failed to retrieve flight number: {str(e)}")
-
     # Auth check if configured (existing RAG logic)
     if HACKRX_BEARER_TOKEN:
         if not authorization or not authorization.startswith("Bearer "):
@@ -477,158 +468,4 @@ async def hackrx_run(data: HackRxRequest, authorization: Optional[str] = Header(
         token = authorization.split("Bearer ")[1]
         if token != HACKRX_BEARER_TOKEN:
             logger.error("Invalid Bearer token.")
-            raise HTTPException(status_code=403, detail="Invalid token.")
-    
-    tmp_path = None
-    vector_store: Optional[FAISS] = None
-    
-    try:
-        start_time = time.time()
-        resp = _retry_request(data.documents, stream=True, timeout=PDF_STREAM_TIMEOUT)
-        content_type = detect_content_type_from_headers_or_url(resp, data.documents)
-        logger.info("Remote content-type detected as: %s", content_type)
-        
-        # ... (rest of the original RAG logic) ...
-        # HTML/text endpoints (including get-secret-token)
-        if "text/html" in content_type or ("text" in content_type and "html" not in content_type and len(resp.content) < 200000):
-            resp_text = resp.text
-            extracted_text = extract_text_from_html(resp_text)
-            docs = [Document(page_content=extracted_text)]
-            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
-            chunks = splitter.split_documents(docs)
-            chunks = [c for c in chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
-            if not chunks:
-                chunks = [Document(page_content=resp_text)]
-            vector_store = FAISS.from_documents(chunks, embeddings)
-            logger.info("Processed HTML/text endpoint into FAISS index with %d chunks", len(chunks))
-        # JSON or plain text
-        elif "application/json" in content_type or "text/plain" in content_type or data.documents.lower().endswith((".json", ".txt")):
-            raw_text = resp.text
-            if "application/json" in content_type or data.documents.lower().endswith(".json"):
-                try:
-                    obj = resp.json()
-                    raw_text = json.dumps(obj, indent=2, ensure_ascii=False)
-                except Exception:
-                    pass
-            docs = [Document(page_content=raw_text)]
-            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
-            chunks = splitter.split_documents(docs)
-            chunks = [c for c in chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
-            vector_store = FAISS.from_documents(chunks, embeddings)
-            logger.info("Processed JSON/text endpoint into FAISS index with %d chunks", len(chunks))
-        else:
-            guessed_ext = mimetypes.guess_extension(content_type.split(";")[0]) or os.path.splitext(data.documents)[1] or ".bin"
-            tmp_path = save_stream_to_tempfile(resp, suffix=guessed_ext)
-            logger.info("File saved to temporary path: %s", tmp_path)
-            ext = os.path.splitext(tmp_path)[1].lower()
-            logger.info("Temporary file ext determined as: %s", ext)
-            if ext == ".pdf":
-                try:
-                    vector_store = build_faiss_index_from_pdf(
-                        pdf_path=tmp_path,
-                        embeddings=embeddings,
-                        chunk_size=1200,
-                        chunk_overlap=CHUNK_OVERLAP,
-                        batch_pages=BATCH_SIZE_PAGES,
-                        max_chunks=MAX_CHUNKS
-                    )
-                except Exception as e:
-                    logger.exception("PDF indexing failed: %s", e)
-                    try:
-                        with fitz.open(tmp_path) as pdf_doc:
-                            all_text = "\n".join([p.get_text() for p in pdf_doc])
-                            docs = [Document(page_content=all_text)]
-                            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
-                            chunks = splitter.split_documents(docs)
-                            vector_store = FAISS.from_documents(chunks[:MAX_CHUNKS], embeddings)
-                    except Exception as e2:
-                        logger.exception("Full PDF extraction fallback failed: %s", e2)
-                        raise HTTPException(status_code=500, detail="Failed to extract text from PDF.")
-            elif ext in [".zip", ".rar", ".7z"]:
-                docs = []
-                try:
-                    if ext == ".zip":
-                        docs = extract_and_load(tmp_path, zipfile.ZipFile)
-                    elif ext == ".rar":
-                        docs = extract_and_load(tmp_path, rarfile.RarFile)
-                    else:
-                        docs = extract_and_load(tmp_path, py7zr.SevenZipFile)
-                except Exception as e:
-                    logger.exception("Archive extraction failed: %s", e)
-                    raise HTTPException(status_code=400, detail="Failed to extract archive contents.")
-                docs = [d for d in docs if d.page_content and len(d.page_content.strip()) >= MIN_CHUNK_LEN]
-                if not docs:
-                    logger.error("No readable content found inside archive.")
-                    raise HTTPException(status_code=400, detail="No readable content found inside archive.")
-                splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
-                chunks = splitter.split_documents(docs)
-                chunks = chunks[:MAX_CHUNKS]
-                vector_store = FAISS.from_documents(chunks, embeddings)
-            else:
-                try:
-                    with open(tmp_path, "rb") as f:
-                        raw = f.read()
-                        try:
-                            decoded = raw.decode("utf-8")
-                        except Exception:
-                            decoded = raw.decode("latin-1", errors="ignore")
-                        docs = [Document(page_content=decoded)]
-                        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=CHUNK_OVERLAP)
-                        chunks = splitter.split_documents(docs)
-                        chunks = [c for c in chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
-                        vector_store = FAISS.from_documents(chunks, embeddings)
-                except Exception as e:
-                    logger.exception("Failed to process binary file: %s", e)
-                    raise HTTPException(status_code=400, detail="Unsupported or unreadable file type.")
-        
-        # Language detection (best-effort)
-        try:
-            first_doc = None
-            for k in vector_store.docstore._dict:
-                first_doc = vector_store.docstore._dict[k]
-                break
-            if first_doc and first_doc.page_content:
-                content_language = detect(first_doc.page_content)
-            else:
-                content_language = "unknown"
-        except Exception:
-            content_language = "unknown"
-            
-        # Answer questions concurrently
-        tasks = [ask_async_chain(qa_chain, vector_store, q.strip()) for q in data.questions]
-        answers = await asyncio.gather(*tasks)
-        
-        # Ensure answers are plain strings
-        normalized_answers = []
-        for a in answers:
-            if isinstance(a, dict):
-                # flatten small dict to a string
-                s = a.get("output_text") or a.get("answer") or a.get("text") or json.dumps(a, ensure_ascii=False)
-                normalized_answers.append(str(s).strip())
-            else:
-                normalized_answers.append(str(a).strip())
-                
-        for q, a in zip(data.questions, normalized_answers):
-            logger.info("----- QUESTION -----\n%s\n----- ANSWER -----\n%s\n", q, a)
-        total_time = time.time() - start_time
-        logger.info("Processing completed in %.2f seconds.", total_time)
-        return {"status": "success", "answers": normalized_answers}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Unexpected error in /hackrx/run: %s", e)
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
-    finally:
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-            
-# -----------------------------
-# Health endpoint
-# -----------------------------
-@app.get("/")
-def health():
-    return {"status": "API is running"}
+            raise HTTPException(
