@@ -30,7 +30,8 @@ import rarfile
 import py7zr
 import pandas as pd
 from PIL import Image
-from langchain.document_loaders import (
+# ✅ Updated imports
+from langchain_community.document_loaders import (
     UnstructuredFileLoader, TextLoader,
     UnstructuredEmailLoader, UnstructuredImageLoader
 )
@@ -54,14 +55,14 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 MIN_CHUNK_LEN = int(os.getenv("MIN_CHUNK_LEN", "50"))
 PDF_STREAM_TIMEOUT = int(os.getenv("PDF_STREAM_TIMEOUT", "60"))
 
-# Logger
+# Logger ✅ Fixed
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(_name_)
 
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="HackRx Insurance Q&A API", version="1.0.2")
+app = FastAPI(title="HackRx Insurance Q&A API", version="1.0.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[""], allow_credentials=True, allow_methods=[""], allow_headers=["*"]
@@ -128,12 +129,10 @@ def build_faiss_from_pdf(pdf_path: str) -> FAISS:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1200, chunk_overlap=CHUNK_OVERLAP
     )
-    faiss_index = None
     docs = list(iter_pdf_pages(pdf_path))
     chunks = splitter.split_documents(docs)
     chunks = [c for c in chunks if len(c.page_content.strip()) >= MIN_CHUNK_LEN]
-    faiss_index = FAISS.from_documents(chunks, embeddings)
-    return faiss_index
+    return FAISS.from_documents(chunks, embeddings)
 
 # -----------------------------
 # Special HackRx flight resolver
