@@ -16,7 +16,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 load_dotenv()
 
 # ---------------- CONFIG ----------------
-BEARER_TOKEN = os.getenv("cff339776dc80b453cdfbfa2f4e8dbafe3fa28e3c05fcebba73c46680c8bf594")
+BEARER_TOKEN ="cff339776dc80b453cdfbfa2f4e8dbafe3fa28e3c05fcebba73c46680c8bf594"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 FLIGHT_CITY_API = os.getenv("FLIGHT_CITY_API", "https://register.hackrx.in/submissions/myFavouriteCity")
 
