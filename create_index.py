@@ -1,12 +1,23 @@
 import os
+import sys
 import time
 import mimetypes
 import zipfile
-import magic
 import tempfile
+import logging
+import argparse
+from typing import List
+
+try:
+    import magic
+except ImportError:
+    magic = None
+
 import pytesseract
 from PIL import Image
 from dotenv import load_dotenv
+from tqdm import tqdm
+
 from langchain_community.document_loaders import (
     PyMuPDFLoader,
     UnstructuredWordDocumentLoader,
@@ -22,29 +33,41 @@ from langchain_community.vectorstores import FAISS
 from langchain.schema import Document
 
 # ---------------------------
-# 1. Load environment variables
+# Logging Setup
 # ---------------------------
-env_path = os.path.join(os.path.dirname(__file__), ".env")
-load_dotenv(dotenv_path=env_path)
-
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY not found in .env file")
-
-os.environ["OPENAI_API_KEY"] = openai_api_key
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
 
 # ---------------------------
-# 2. Paths
+# Environment Setup
 # ---------------------------
-docs_folder_path = "./documents/"
-faiss_index_path = "faiss_universal_index"
+def load_env(env_path: str = ".env") -> None:
+    """Load environment variables from a .env file."""
+    load_dotenv(dotenv_path=env_path)
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        logger.error("OPENAI_API_KEY not found in .env file.")
+        sys.exit(1)
+    os.environ["OPENAI_API_KEY"] = openai_api_key
 
 # ---------------------------
-# 3. File type detection
+# File Type Detection
 # ---------------------------
-def detect_file_type(file_path):
-    mime_type = magic.from_file(file_path, mime=True)
-    ext = mimetypes.guess_extension(mime_type) or ""
+def detect_file_type(file_path: str) -> str:
+    """Detect file extension by magic numbers and mimetypes."""
+    if magic:
+        try:
+            mime_type = magic.from_file(file_path, mime=True)
+            ext = mimetypes.guess_extension(mime_type) or ""
+        except Exception as e:
+            logger.warning(f"magic failed: {e}")
+            ext = ""
+    else:
+        ext = mimetypes.guess_extension(mimetypes.guess_type(file_path)[0] or '') or ""
 
     with open(file_path, "rb") as f:
         sig = f.read(8)
@@ -65,13 +88,13 @@ def detect_file_type(file_path):
         return ".jpg"
     if sig.startswith(b"\x89PNG\r\n\x1a\n"):
         return ".png"
-
     return ext or ".txt"
 
 # ---------------------------
-# 4. Universal loader
+# Universal Loader
 # ---------------------------
-def load_document(file_path):
+def load_document(file_path: str) -> List[Document]:
+    """Load a document and extract its content as Document(s)."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext in ["", ".bin"]:
         ext = detect_file_type(file_path)
@@ -111,70 +134,92 @@ def load_document(file_path):
                     text = f.read()
                 return [Document(page_content=text, metadata={"source": file_path})]
             except Exception as e:
-                print(f"⚠ Cannot read {file_path} as text: {e}")
+                logger.warning(f"Cannot read {file_path} as text: {e}")
                 return []
     except Exception as e:
-        print(f"❌ Failed to load {file_path}: {e}")
+        logger.error(f"Failed to load {file_path}: {e}")
         return []
 
 # ---------------------------
-# 5. Load all documents from folder
+# Load All Documents (with progress bar)
 # ---------------------------
-def load_all_documents(folder_path):
+def load_all_documents(folder_path: str) -> List[Document]:
+    """Load all documents from a folder recursively."""
     all_docs = []
     if not os.path.exists(folder_path):
-        print(f"Folder '{folder_path}' not found.")
+        logger.error(f"Folder '{folder_path}' not found.")
         return []
 
+    files_to_load = []
     for root, _, files in os.walk(folder_path):
         for filename in files:
-            file_path = os.path.join(root, filename)
-            docs = load_document(file_path)
-            if docs:
-                all_docs.extend(docs)
-                print(f"✅ Loaded: {filename}")
-            else:
-                print(f"⚠ Skipped: {filename}")
+            files_to_load.append(os.path.join(root, filename))
+
+    for file_path in tqdm(files_to_load, desc="Loading documents"):
+        docs = load_document(file_path)
+        if docs:
+            all_docs.extend(docs)
+            logger.info(f"Loaded: {os.path.basename(file_path)}")
+        else:
+            logger.warning(f"Skipped: {os.path.basename(file_path)}")
     return all_docs
 
 # ---------------------------
-# 6. Chunking
+# Chunking
 # ---------------------------
-def chunk_documents(documents):
+def chunk_documents(documents: List[Document], chunk_size: int = 1000, chunk_overlap: int = 150) -> List[Document]:
+    """Chunk the documents using RecursiveCharacterTextSplitter."""
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
     )
     return splitter.split_documents(documents)
 
 # ---------------------------
-# 7. Create FAISS index
+# Create FAISS Index
 # ---------------------------
-def create_and_save_index(chunks, index_path):
-    print("🔧 Creating embeddings...")
+def create_and_save_index(chunks: List[Document], index_path: str) -> None:
+    """Create FAISS index and save locally."""
+    logger.info("Creating embeddings...")
     embeddings = OpenAIEmbeddings()
-    print("📦 Building FAISS index...")
+    logger.info("Building FAISS index...")
     vector_store = FAISS.from_documents(chunks, embeddings)
     vector_store.save_local(index_path)
-    print(f"✅ Index saved at: {index_path}")
+    logger.info(f"Index saved at: {index_path}")
 
 # ---------------------------
-# 8. Main
+# Argument Parsing
 # ---------------------------
-if __name__ == "__main__":
+def parse_args():
+    parser = argparse.ArgumentParser(description="Index documents into FAISS vector store.")
+    parser.add_argument("--docs", type=str, default="./documents/", help="Path to documents folder")
+    parser.add_argument("--index", type=str, default="faiss_universal_index", help="Path to save FAISS index")
+    parser.add_argument("--env", type=str, default=".env", help="Path to .env file")
+    parser.add_argument("--chunk_size", type=int, default=1000, help="Size of each text chunk")
+    parser.add_argument("--chunk_overlap", type=int, default=150, help="Overlap between chunks")
+    return parser.parse_args()
+
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    args = parse_args()
+    load_env(args.env)
     start_time = time.time()
 
-    print("📄 Loading documents...")
-    docs = load_all_documents(docs_folder_path)
+    logger.info("Loading documents...")
+    docs = load_all_documents(args.docs)
 
     if docs:
-        print("✂ Splitting into chunks...")
-        chunks = chunk_documents(docs)
-        print(f"🔢 Total chunks: {len(chunks)}")
-
-        print("💾 Saving FAISS index...")
-        create_and_save_index(chunks, faiss_index_path)
+        logger.info("Splitting into chunks...")
+        chunks = chunk_documents(docs, chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap)
+        logger.info(f"Total chunks: {len(chunks)}")
+        logger.info("Saving FAISS index...")
+        create_and_save_index(chunks, args.index)
     else:
-        print("⚠ No documents found.")
+        logger.warning("No documents found.")
 
-    print(f"⏱ Done in {time.time() - start_time:.2f} seconds")
+    logger.info(f"Done in {time.time() - start_time:.2f} seconds.")
+
+if __name__ == "__main__":
+    main()
