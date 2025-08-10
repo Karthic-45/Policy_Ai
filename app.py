@@ -57,7 +57,7 @@ except Exception:
 # -----------------------------
 # Logging (fixed)
 # -----------------------------
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # -----------------------------
