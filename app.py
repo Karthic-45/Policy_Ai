@@ -65,7 +65,7 @@ HACKRX_BEARER_TOKEN = os.getenv("HACKRX_BEARER_TOKEN")
 
 # Configurable knobs
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4-1106-preview")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4")
 BATCH_SIZE_PAGES = int(os.getenv("BATCH_SIZE_PAGES", "25"))
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "2500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
