@@ -413,7 +413,14 @@ def get_flight_number() -> str:
 
         if not flight_number:
             raise HTTPException(status_code=400, detail="Flight number not found")
-
+        response = {
+            "success": True,
+            "message": f"{city} flight number generated successfully",
+            "status": 200,
+            "data": {
+                "flightNumber": flight_number
+            }
+        }
         logger.info(f"Clean flight number: {flight_number}")
         return flight_number
 
