@@ -18,7 +18,7 @@ from langchain.docstore.document import Document
 # ----------------------------
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-BEARER_TOKEN = os.getenv("BEARER_TOKEN", "hackrx_token")
+BEARER_TOKEN = os.getenv("BEARER_TOKEN", "cff339776dc80b453cdfbfa2f4e8dbafe3fa28e3c05fcebba73c46680c8bf594")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 app = FastAPI()
