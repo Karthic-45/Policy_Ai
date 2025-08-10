@@ -34,6 +34,7 @@ from functools import partial
 import requests
 import fitz  # PyMuPDF
 from bs4 import BeautifulSoup
+import asyncio
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
