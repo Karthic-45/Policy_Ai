@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Config
-BEARER_TOKEN = "YOUR_BEARER_TOKEN_HERE"  # replace with actual
+BEARER_TOKEN = "cff339776dc80b453cdfbfa2f4e8dbafe3fa28e3c05fcebba73c46680c8bf594"  # replace with actual
 PDF_TIMEOUT = 30
 
 app = FastAPI(title="Flight Number Extractor", version="1.0.0")
