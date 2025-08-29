@@ -8,74 +8,32 @@
 <body>
     <h1>Policy AI Frontend</h1>
     <form id="dataForm">
-        <input type="text" id="inputField" placeholder="Enter something..." required>
-        <button type="submit">Send</button>
+        <input type="text" id="docField" placeholder="Document URL" required>
+        <input type="text" id="questionField" placeholder="Enter your question" required>
+        <button type="submit">Ask</button>
     </form>
     <div id="result"></div>
 
-    <!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>HackRx Q&A Client</title>
-  <style>
-    body { font-family: sans-serif; max-width: 600px; margin: 30px auto; }
-    label { display: block; margin-top: 15px; font-weight: bold; }
-    textarea, input { width: 100%; padding: 8px; margin-top: 5px; }
-    button { margin-top: 20px; padding: 10px 20px; }
-    pre { background: #f4f4f4; padding: 15px; border-radius: 6px; }
-  </style>
-</head>
-<body>
-  <h1>HackRx Insurance Q&A</h1>
-  
-  <form id="dataForm">
-    <label for="inputField">Document URL:</label>
-    <input type="text" id="inputField" placeholder="https://example.com/document.pdf" required>
-    
-    <label for="questionField">Question:</label>
-    <textarea id="questionField" placeholder="Enter your question here..." required></textarea>
-    
-    <button type="submit">Ask</button>
-  </form>
-
-  <h2>Result</h2>
-  <pre id="result"></pre>
-
-  <script>
+    <script>
     document.getElementById('dataForm').addEventListener('submit', async function(e) {
-      e.preventDefault();
-      
-      const docUrl = document.getElementById('inputField').value;
-      const question = document.getElementById('questionField').value;
+        e.preventDefault();
+        const docUrl = document.getElementById('docField').value;
+        const question = document.getElementById('questionField').value;
 
-      try {
-        const res = await fetch('http://localhost:8000/hackrx/run', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            // 'Authorization': 'Bearer YOUR_HACKRX_BEARER_TOKEN' // uncomment if needed
-          },
-          body: JSON.stringify({
+        const payload = {
             documents: docUrl,
             questions: [question]
-          })
-        });
+        };
 
-        if (!res.ok) {
-          throw new Error(`Request failed: ${res.status}`);
-        }
+        const res = await fetch('https://policyai-production.up.railway.app/hackrx/run', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        });
 
         const json = await res.json();
         document.getElementById('result').textContent = JSON.stringify(json, null, 2);
-
-      } catch (err) {
-        document.getElementById('result').textContent = 'Error: ' + err.message;
-      }
     });
-  </script>
-</body>
-</html>
-
+    </script>
 </body>
 </html>
